@@ -280,6 +280,27 @@ class DG822Connection:
             print(f"Write error: {e}")
             return False
     
+    def write_raw(self, data: bytes) -> bool:
+        """
+        Send raw bytes to the instrument (for binary data blocks).
+        
+        Args:
+            data: Raw bytes to send
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self._connected or not self._instrument:
+            print("Error: Not connected to instrument")
+            return False
+        
+        try:
+            self._instrument.write_raw(data)
+            return True
+        except Exception as e:
+            print(f"Write raw error: {e}")
+            return False
+    
     def query(self, command: str) -> Optional[str]:
         """
         Send a SCPI query and return the response.

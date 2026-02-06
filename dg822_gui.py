@@ -18,7 +18,12 @@ import numpy as np
 
 from dg822_controller import DG822Controller
 from dg822_plot import WaveformPlotter
-from dg822_arbitrarywf import ArbitraryWaveform, WaveformGenerator
+from dg822_arbitrarywf import (
+    ArbitraryWaveform, WaveformGenerator,
+    compute_optimal_points, compute_optimal_points_for_comb,
+    check_frequency_feasibility, DG822_MAX_POINTS, DG822_MAX_SAMPLE_RATE,
+    DG822_MIN_SAMPLE_RATE,
+)
 
 
 class ConnectionFrame(ttk.LabelFrame):
@@ -279,8 +284,9 @@ class ChannelFrame(ttk.LabelFrame):
         self.freq_unit.grid(row=0, column=2, padx=5, pady=3)
         
         # Hint about equation support
-        ttk.Label(param_frame, text="(e.g. 1/0.1 = 10)", 
-                  font=("TkDefaultFont", 8), foreground="gray").grid(row=0, column=3, sticky="w", padx=5)
+        self.freq_hint_label = ttk.Label(param_frame, text="(e.g. 1/0.1 = 10)", 
+                  font=("TkDefaultFont", 8), foreground="gray")
+        self.freq_hint_label.grid(row=0, column=3, sticky="w", padx=5)
         
         # Amplitude
         ttk.Label(param_frame, text="Amplitude:").grid(row=1, column=0, sticky="e", padx=5, pady=3)
@@ -509,10 +515,14 @@ class ChannelFrame(ttk.LabelFrame):
         """Handle waveform type change - show/hide relevant parameters."""
         wf = self.waveform_var.get()
         
-        # Show/hide frequency (not applicable to Noise and DC)
-        freq_state = "disabled" if wf in ["Noise", "DC"] else "normal"
-        self.freq_entry.config(state=freq_state)
-        self.freq_unit.config(state="disabled" if wf in ["Noise", "DC"] else "readonly")
+        # Show/hide frequency (not applicable to Noise, DC, or comb arb)
+        is_comb = (wf == "Arbitrary"
+                   and self.arb_waveform is not None
+                   and hasattr(self.arb_waveform, 'comb_info')
+                   and self.arb_waveform.comb_info)
+        freq_disabled = wf in ["Noise", "DC"] or is_comb
+        self.freq_entry.config(state="disabled" if freq_disabled else "normal")
+        self.freq_unit.config(state="disabled" if freq_disabled else "readonly")
         
         # Show/hide phase (not applicable to Noise and DC)
         phase_state = "disabled" if wf in ["Noise", "DC"] else "normal"
@@ -546,8 +556,23 @@ class ChannelFrame(ttk.LabelFrame):
         # Show/hide arbitrary waveform frame
         if wf == "Arbitrary":
             self.arb_frame.grid()
+            # Update frequency hint for arb mode
+            if (self.arb_waveform is not None 
+                    and hasattr(self.arb_waveform, 'comb_info') 
+                    and self.arb_waveform.comb_info):
+                f0 = self.arb_waveform.comb_info['fundamental']
+                self.freq_hint_label.config(
+                    text=f"(comb fundamental: {f0:.4g} Hz)",
+                    foreground="blue")
+            else:
+                self.freq_hint_label.config(
+                    text="(sets output repetition rate)",
+                    foreground="gray")
         else:
             self.arb_frame.grid_remove()
+            self.freq_hint_label.config(
+                text="(e.g. 1/0.1 = 10)",
+                foreground="gray")
         
         # Update the plot preview
         self._update_plot()
@@ -731,12 +756,34 @@ class ChannelFrame(ttk.LabelFrame):
                 success = controller.setup_dc(self.channel, offset)
             elif wf == "Arbitrary":
                 if self.arb_waveform is not None and controller.waveform:
-                    # Upload and apply arbitrary waveform
-                    if controller.waveform.upload_arbitrary_waveform_from_object(self.channel, self.arb_waveform):
-                        success = controller.waveform.apply_arbitrary(self.channel, freq, amp, offset, phase)
-                    else:
+                    # First, ensure waveform has a name
+                    if not self.arb_waveform.name:
+                        self.arb_waveform.name = "CUSTOM"
+                    
+                    # Upload arbitrary waveform (binary DAC16 format)
+                    # The upload with flag=END auto-switches device to SEQUENCE mode
+                    if not controller.waveform.upload_arbitrary_waveform_from_object(self.channel, self.arb_waveform):
                         messagebox.showerror("Error", "Failed to upload arbitrary waveform.")
                         return
+                    
+                    # Save to internal memory as .RAF file
+                    raf_name = self.arb_waveform.name[:7]  # Max 7 chars
+                    controller.waveform.store_arb_file(raf_name)
+                    
+                    # Determine the output frequency:
+                    #  - For frequency combs: use the fundamental (comb repetition rate)
+                    #  - For other shapes:    use the frequency from the main controls
+                    num_pts = len(self.arb_waveform.data)
+                    if hasattr(self.arb_waveform, 'comb_info') and self.arb_waveform.comb_info:
+                        arb_freq = self.arb_waveform.comb_info['fundamental']
+                    else:
+                        arb_freq = freq
+                    
+                    # Set parameters (sample rate, amplitude, offset, phase)
+                    # Do NOT call :APPLy:USER — that resets to built-in SINC!
+                    success = controller.waveform.apply_arbitrary(
+                        self.channel, arb_freq, amp, offset, phase, num_points=num_pts
+                    )
                 else:
                     messagebox.showwarning("No Waveform", "Please load or generate an arbitrary waveform first.")
                     return
@@ -782,10 +829,17 @@ class ChannelFrame(ttk.LabelFrame):
         
         if wf_type is not None:
             wf_map = {"SIN": "Sine", "SQU": "Square", "PULS": "Pulse", 
-                      "RAMP": "Ramp", "NOIS": "Noise", "DC": "DC", "ARB": "Arbitrary"}
-            mapped = wf_map.get(wf_type.upper()[:4], "Sine")
-            self.waveform_var.set(mapped)
-            self._on_waveform_change()
+                      "RAMP": "Ramp", "NOIS": "Noise", "DC": "DC", "ARB": "Arbitrary",
+                      "SEQU": "Arbitrary", "USER": "Arbitrary"}
+            mapped = wf_map.get(wf_type.upper()[:4], wf_type)
+            # If we're in SEQUENCE mode (arbitrary uploaded), keep showing Arbitrary
+            # and don't clobber arb_waveform by re-triggering _on_waveform_change
+            if mapped == "Arbitrary" and self.waveform_var.get() == "Arbitrary":
+                # Already showing Arbitrary — just refresh non-waveform fields
+                pass
+            else:
+                self.waveform_var.set(mapped)
+                self._on_waveform_change()
         
         self.output_var.set(output_on)
         self._update_output_indicator(output_on)
@@ -930,14 +984,38 @@ class ChannelFrame(ttk.LabelFrame):
     
     def _generate_arb(self):
         """Open dialog to generate an arbitrary waveform."""
-        dialog = ArbGeneratorDialog(self)
+        output_freq = self._get_frequency_hz()
+        dialog = ArbGeneratorDialog(self, output_frequency=output_freq)
         self.wait_window(dialog)
         
         if dialog.result is not None:
             self.arb_waveform = dialog.result
-            self.arb_file_var.set(f"Generated: {dialog.waveform_type} ({len(self.arb_waveform.data)} pts)")
+            pts = len(self.arb_waveform.data)
+            self.arb_file_var.set(f"Generated: {dialog.waveform_type} ({pts} pts)")
+            
+            # For frequency combs: auto-set the frequency box to the fundamental
+            if (hasattr(self.arb_waveform, 'comb_info') 
+                    and self.arb_waveform.comb_info):
+                f0 = self.arb_waveform.comb_info['fundamental']
+                # Set frequency box to fundamental
+                if f0 >= 1e6:
+                    self.freq_var.set(f"{f0/1e6:.6g}")
+                    self.freq_unit_var.set("MHz")
+                elif f0 >= 1e3:
+                    self.freq_var.set(f"{f0/1e3:.6g}")
+                    self.freq_unit_var.set("kHz")
+                else:
+                    self.freq_var.set(f"{f0:.6g}")
+                    self.freq_unit_var.set("Hz")
+                self.freq_hint_label.config(
+                    text=f"(comb fundamental: {f0:.4g} Hz)",
+                    foreground="blue")
+                # Disable freq entry — comb fundamental is fixed
+                self.freq_entry.config(state="disabled")
+                self.freq_unit.config(state="disabled")
+            
             messagebox.showinfo("Success", 
-                f"Generated {dialog.waveform_type} with {len(self.arb_waveform.data)} points")
+                f"Generated {dialog.waveform_type} with {pts} points")
             self._update_plot()
     
     def _upload_arb(self):
@@ -954,13 +1032,43 @@ class ChannelFrame(ttk.LabelFrame):
         try:
             # Ask for waveform name
             name = simpledialog.askstring("Waveform Name", 
-                "Enter name for the arbitrary waveform:",
+                "Enter name for the arbitrary waveform (max 7 chars):",
                 initialvalue=self.arb_waveform.name or "CUSTOM")
             
             if name:
-                self.arb_waveform.name = name
+                self.arb_waveform.name = name[:7]
+                
+                # Upload to volatile memory (auto-switches to SEQUENCE mode)
                 if controller.waveform.upload_arbitrary_waveform_from_object(self.channel, self.arb_waveform):
-                    messagebox.showinfo("Success", f"Uploaded waveform '{name}' to CH{self.channel}")
+                    # Save to internal memory as .RAF file
+                    raf_name = self.arb_waveform.name[:7]
+                    controller.waveform.store_arb_file(raf_name)
+                    
+                    # Set parameters individually (do NOT use :APPLy:USER)
+                    try:
+                        freq = self._get_frequency_hz()
+                        amp = float(self.amp_var.get())
+                        offset = float(self.offset_var.get())
+                        phase = float(self.phase_var.get())
+                        num_pts = len(self.arb_waveform.data)
+                        
+                        # For frequency combs use the fundamental as output freq
+                        if hasattr(self.arb_waveform, 'comb_info') and self.arb_waveform.comb_info:
+                            freq = self.arb_waveform.comb_info['fundamental']
+                        
+                        controller.waveform.apply_arbitrary(
+                            self.channel, freq, amp, offset, phase, num_points=num_pts
+                        )
+                    except Exception as e:
+                        print(f"Warning: Could not set arb parameters: {e}")
+                    
+                    # Keep GUI on Arbitrary view
+                    self.waveform_var.set("Arbitrary")
+                    self._on_waveform_change()
+                    self._update_plot()
+                    
+                    messagebox.showinfo("Success", 
+                        f"Uploaded and saved '{raf_name}.RAF' to CH{self.channel}")
                 else:
                     messagebox.showerror("Error", "Failed to upload waveform to instrument.")
         except Exception as e:
@@ -968,18 +1076,30 @@ class ChannelFrame(ttk.LabelFrame):
 
 
 class ArbGeneratorDialog(tk.Toplevel):
-    """Dialog for generating arbitrary waveforms."""
+    """Dialog for generating arbitrary waveforms.
     
-    def __init__(self, parent):
+    The number of waveform points is computed automatically to maximise
+    smoothness within the DG822's hardware limits (8–16 384 points,
+    sample rate 2 kSa/s – 30 MSa/s).
+    
+    For basic shapes the output frequency from the main controls is used.
+    For frequency combs the fundamental (GCD of comb tones) drives the
+    calculation and warnings are shown when the frequency span is too
+    wide for the available point budget.
+    """
+    
+    def __init__(self, parent, output_frequency: float = 1000.0):
         super().__init__(parent)
         self.title("Generate Arbitrary Waveform")
         self.result = None
         self.waveform_type = None
+        self.output_frequency = output_frequency  # Hz, from main controls
         
         self.transient(parent)
         self.grab_set()
         
         self._create_widgets()
+        self._update_info()  # initial info display
         
         # Center dialog
         self.update_idletasks()
@@ -992,7 +1112,10 @@ class ArbGeneratorDialog(tk.Toplevel):
         main_frame.pack(fill="both", expand=True)
         
         # Info label
-        ttk.Label(main_frame, text="Generate a normalized waveform shape.\nFrequency, amplitude, and offset are set in the main controls.",
+        ttk.Label(main_frame,
+                  text="Generate a normalized waveform shape.\n"
+                       "Points are auto-calculated for maximum smoothness.\n"
+                       "Frequency, amplitude, and offset are set in the main controls.",
                   justify="center").grid(row=0, column=0, columnspan=3, pady=10)
         
         # Waveform type
@@ -1003,21 +1126,16 @@ class ArbGeneratorDialog(tk.Toplevel):
         type_combo.grid(row=1, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         type_combo.bind("<<ComboboxSelected>>", self._on_type_change)
         
-        # Points
-        ttk.Label(main_frame, text="Points:").grid(row=2, column=0, sticky="e", padx=5, pady=5)
-        self.points_var = tk.StringVar(value="16384")
-        ttk.Entry(main_frame, textvariable=self.points_var, width=15).grid(row=2, column=1, sticky="w", padx=5, pady=5)
-        
         # Duty/Symmetry (for basic waveforms)
         self.duty_label = ttk.Label(main_frame, text="Duty/Symmetry (%):")
-        self.duty_label.grid(row=3, column=0, sticky="e", padx=5, pady=5)
+        self.duty_label.grid(row=2, column=0, sticky="e", padx=5, pady=5)
         self.duty_var = tk.StringVar(value="50")
         self.duty_entry = ttk.Entry(main_frame, textvariable=self.duty_var, width=15)
-        self.duty_entry.grid(row=3, column=1, sticky="w", padx=5, pady=5)
+        self.duty_entry.grid(row=2, column=1, sticky="w", padx=5, pady=5)
         
         # === Frequency Comb Frame ===
         self.comb_frame = ttk.LabelFrame(main_frame, text="Frequency Comb Settings", padding=5)
-        self.comb_frame.grid(row=4, column=0, columnspan=3, sticky="ew", padx=5, pady=10)
+        self.comb_frame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=5, pady=10)
         
         # Frequency input mode
         ttk.Label(self.comb_frame, text="Frequency Input:").grid(row=0, column=0, sticky="e", padx=5, pady=3)
@@ -1065,8 +1183,26 @@ class ArbGeneratorDialog(tk.Toplevel):
         self.mc_iter_var = tk.StringVar(value="1000")
         ttk.Entry(self.comb_frame, textvariable=self.mc_iter_var, width=10).grid(row=4, column=1, sticky="w", padx=5)
         
+        # Preview/calculate button for comb
+        ttk.Button(self.comb_frame, text="Preview Points",
+                   command=self._update_info).grid(row=5, column=0, columnspan=3, pady=5)
+        
         # Hide comb frame by default
         self.comb_frame.grid_remove()
+        
+        # === Info / Warning Display ===
+        self.info_frame = ttk.LabelFrame(main_frame, text="Waveform Info", padding=5)
+        self.info_frame.grid(row=4, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
+        
+        self.info_var = tk.StringVar(value="")
+        self.info_label = ttk.Label(self.info_frame, textvariable=self.info_var,
+                                    justify="left", wraplength=500)
+        self.info_label.pack(fill="x", padx=5, pady=3)
+        
+        self.warning_var = tk.StringVar(value="")
+        self.warning_label = ttk.Label(self.info_frame, textvariable=self.warning_var,
+                                       foreground="red", justify="left", wraplength=500)
+        self.warning_label.pack(fill="x", padx=5, pady=3)
         
         # Buttons
         btn_frame = ttk.Frame(main_frame)
@@ -1086,6 +1222,7 @@ class ArbGeneratorDialog(tk.Toplevel):
             self.duty_label.grid()
             self.duty_entry.grid()
             self.comb_frame.grid_remove()
+        self._update_info()
     
     def _on_freq_mode_change(self):
         """Handle frequency input mode change."""
@@ -1096,51 +1233,106 @@ class ArbGeneratorDialog(tk.Toplevel):
             self.range_frame.grid_remove()
             self.list_frame.grid()
     
-    def _generate(self):
-        """Generate the waveform."""
+    def _get_comb_frequencies(self):
+        """Parse comb frequency inputs and return list of floats."""
+        if self.freq_mode_var.get() == "range":
+            start = float(self.start_freq_var.get())
+            stop = float(self.stop_freq_var.get())
+            step = float(self.step_freq_var.get())
+            return list(np.arange(start, stop + step / 2, step))
+        else:
+            return [float(f.strip()) for f in self.freq_list_var.get().split(",") if f.strip()]
+    
+    def _update_info(self):
+        """Update the info/warning display based on current settings."""
         try:
             wf_type = self.type_var.get()
-            points = int(self.points_var.get())
+            if wf_type == "frequency_comb":
+                freqs = self._get_comb_frequencies()
+                if not freqs:
+                    self.info_var.set("No frequencies specified.")
+                    self.warning_var.set("")
+                    return
+                num_pts, info = compute_optimal_points_for_comb(freqs)
+                self.info_var.set(
+                    f"Fundamental: {info['fundamental']:.4g} Hz | "
+                    f"Highest tone: {info['f_max']:.4g} Hz\n"
+                    f"Harmonics in period: {info['harmonics']:.1f} cycles | "
+                    f"Min points needed: {info['min_points_needed']}\n"
+                    f"Optimal points: {num_pts} | "
+                    f"Sample rate: {info['sample_rate']/1e3:.1f} kSa/s"
+                )
+                self.warning_var.set(info.get('warning') or "")
+            else:
+                freq = self.output_frequency
+                num_pts = compute_optimal_points(freq)
+                sr = freq * num_pts
+                info = check_frequency_feasibility(freq, num_pts)
+                self.info_var.set(
+                    f"Output frequency: {freq:.4g} Hz\n"
+                    f"Optimal points: {num_pts} | "
+                    f"Sample rate: {sr/1e3:.1f} kSa/s"
+                )
+                self.warning_var.set(info.get('warning') or "")
+        except (ValueError, ZeroDivisionError) as e:
+            self.info_var.set(f"Cannot compute: {e}")
+            self.warning_var.set("")
+    
+    def _generate(self):
+        """Generate the waveform with auto-optimal points."""
+        try:
+            wf_type = self.type_var.get()
             duty = float(self.duty_var.get())
             
             self.waveform_type = wf_type
             
-            # WaveformGenerator creates normalized waveforms (-1 to +1)
-            # Frequency, amplitude, and offset are applied when using the waveform
-            if wf_type == "square":
-                self.result = WaveformGenerator.square(points, duty)
-            elif wf_type == "sine":
-                self.result = WaveformGenerator.sine(points)
-            elif wf_type == "ramp":
-                self.result = WaveformGenerator.ramp(points, duty)  # duty acts as symmetry
-            elif wf_type == "pulse":
-                self.result = WaveformGenerator.pulse(points, duty)  # duty acts as width_percent
-            elif wf_type == "sinc":
-                self.result = WaveformGenerator.sinc(points)
-            elif wf_type == "exponential":
-                self.result = WaveformGenerator.exponential(points)
-            elif wf_type == "gaussian":
-                self.result = WaveformGenerator.gaussian(points)
-            elif wf_type == "frequency_comb":
-                self.result = self._generate_frequency_comb(points)
+            if wf_type == "frequency_comb":
+                self.result = self._generate_frequency_comb()
+            else:
+                # Auto-calculate optimal points from output frequency
+                points = compute_optimal_points(self.output_frequency)
+                info = check_frequency_feasibility(self.output_frequency, points)
+                if info.get('warning'):
+                    if not messagebox.askyesno("Warning", 
+                            f"{info['warning']}\n\nContinue anyway?"):
+                        return
+                
+                if wf_type == "square":
+                    self.result = WaveformGenerator.square(points, duty)
+                elif wf_type == "sine":
+                    self.result = WaveformGenerator.sine(points)
+                elif wf_type == "ramp":
+                    self.result = WaveformGenerator.ramp(points, duty)
+                elif wf_type == "pulse":
+                    self.result = WaveformGenerator.pulse(points, duty)
+                elif wf_type == "sinc":
+                    self.result = WaveformGenerator.sinc(points)
+                elif wf_type == "exponential":
+                    self.result = WaveformGenerator.exponential_decay(points)
+                elif wf_type == "gaussian":
+                    self.result = WaveformGenerator.gaussian(points)
             
-            self.destroy()
+            if self.result is not None:
+                self.destroy()
             
         except ValueError as e:
             messagebox.showerror("Error", f"Invalid parameter: {e}")
     
-    def _generate_frequency_comb(self, points: int):
-        """Generate frequency comb waveform."""
-        # Get frequencies
-        if self.freq_mode_var.get() == "range":
-            start_freq = float(self.start_freq_var.get())
-            stop_freq = float(self.stop_freq_var.get())
-            step_freq = float(self.step_freq_var.get())
-            frequencies = None
-        else:
-            freq_str = self.freq_list_var.get()
-            frequencies = [float(f.strip()) for f in freq_str.split(",") if f.strip()]
-            start_freq = stop_freq = step_freq = None
+    def _generate_frequency_comb(self):
+        """Generate frequency comb with auto-optimal points."""
+        freqs = self._get_comb_frequencies()
+        if not freqs:
+            messagebox.showerror("Error", "No frequencies specified.")
+            return None
+        
+        # Compute optimal points and check feasibility
+        num_pts, info = compute_optimal_points_for_comb(freqs)
+        
+        if info.get('warning'):
+            if not messagebox.askyesno("Warning",
+                    f"{info['warning']}\n\n"
+                    f"Will use {num_pts} points.\nContinue anyway?"):
+                return None
         
         # Get phase options
         random_phases = self.phase_mode_var.get() == "random"
@@ -1152,11 +1344,8 @@ class ArbGeneratorDialog(tk.Toplevel):
             self.title("Generating... (Monte Carlo optimization)")
         
         return WaveformGenerator.frequency_comb(
-            frequencies=frequencies,
-            start_freq=start_freq,
-            stop_freq=stop_freq,
-            step_freq=step_freq,
-            num_points=points,
+            frequencies=freqs,
+            num_points=num_pts,
             random_phases=random_phases,
             monte_carlo_iterations=mc_iterations
         )

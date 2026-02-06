@@ -183,22 +183,65 @@ class DG822Waveform:
     
     def apply_arbitrary(self, channel: int = 1, frequency: float = 1000.0,
                         amplitude: float = 5.0, offset: float = 0.0,
-                        phase: float = 0.0) -> bool:
+                        phase: float = 0.0, num_points: int = None) -> bool:
         """
-        Configure channel to output the currently loaded arbitrary waveform.
+        Set parameters for the currently loaded arbitrary waveform.
+        
+        On the DG822, uploading via DATA:DAC16 VOLATILE,END auto-switches
+        the device to SEQUENCE mode. We must NOT call :APPLy:USER or
+        :FUNCtion USER as those reset to the built-in SINC waveform.
+        
+        Instead, we set the sample rate (which controls output frequency)
+        and individual amplitude/offset/phase parameters.
+        
+        Output frequency = sample_rate / num_points
+        So: sample_rate = frequency * num_points
         
         Args:
             channel: Output channel (1 or 2)
-            frequency: Frequency in Hz (default: 1000 Hz)
-            amplitude: Amplitude in Vpp (default: 5 Vpp)
-            offset: DC offset in V (default: 0 V)
-            phase: Start phase in degrees (default: 0°)
+            frequency: Desired output frequency in Hz
+            amplitude: Amplitude in Vpp
+            offset: DC offset in V
+            phase: Start phase in degrees
+            num_points: Number of points in the uploaded waveform
             
         Returns:
             True if successful
         """
-        cmd = f":SOURce{channel}:APPLy:ARBitrary {frequency},{amplitude},{offset},{phase}"
-        return self._conn.write(cmd)
+        import time
+        success = True
+        
+        # Set sample rate to achieve desired frequency
+        # sample_rate = frequency * num_points
+        if num_points and num_points > 0:
+            sample_rate = frequency * num_points
+            # DG822 sample rate range: 2 kSa/s to 30 MSa/s
+            sample_rate = max(2000, min(sample_rate, 30e6))
+            cmd_sr = f":SOURce{channel}:FUNCtion:SEQuence:SRATe {sample_rate}"
+            if not self._conn.write(cmd_sr):
+                print(f"Warning: Failed to set sample rate to {sample_rate}")
+                success = False
+            time.sleep(0.1)
+        
+        # Set amplitude
+        cmd_amp = f":SOURce{channel}:VOLTage {amplitude}"
+        if not self._conn.write(cmd_amp):
+            print(f"Warning: Failed to set amplitude to {amplitude}")
+            success = False
+        
+        # Set offset
+        cmd_off = f":SOURce{channel}:VOLTage:OFFSet {offset}"
+        if not self._conn.write(cmd_off):
+            print(f"Warning: Failed to set offset to {offset}")
+            success = False
+        
+        # Set phase
+        cmd_ph = f":SOURce{channel}:PHASe {phase}"
+        if not self._conn.write(cmd_ph):
+            print(f"Warning: Failed to set phase to {phase}")
+            success = False
+        
+        return success
     
     # =========================================================================
     # Individual Parameter Control
@@ -553,46 +596,71 @@ class DG822Waveform:
         """
         Upload an arbitrary waveform to the instrument's volatile memory.
         
+        Uses the DG800 (non-Pro) binary DAC16 format:
+          :SOURce[<n>]:TRACe:DATA:DAC16 VOLATILE,END,#<digits><byte_count><binary_data>
+        
+        Data format: unsigned 16-bit, range 0x0000-0x3FFF (0-16383).
+        When flag=END, the instrument switches to arbitrary waveform output
+        automatically.
+        
         Args:
             channel: Output channel (1 or 2)
             name: Name for the waveform (max 12 characters)
-            data: Array of DAC values (-8192 to +8191) or normalized (-1 to +1)
+            data: Array of normalized values (-1 to +1) or DAC values
             
         Returns:
             True if successful
         """
         import numpy as np
+        import struct
         
-        # Validate data length
+        # Validate data length (8 to 16384 points per DG800 guide)
         if len(data) < 8 or len(data) > 16384:
             print(f"Error: Data length must be 8-16384 points (got {len(data)})")
             return False
         
-        # Check if data is normalized (-1 to +1) or DAC values
-        if np.max(np.abs(data)) <= 1.0:
-            # Normalized data - convert to DAC values
-            dac_data = np.round(data * 8191).astype(np.int16)
+        # Normalize data to -1..+1 range first
+        max_abs = np.max(np.abs(data))
+        if max_abs > 1.0:
+            normalized = data / max_abs
         else:
-            # Already DAC values
-            dac_data = np.clip(data, -8192, 8191).astype(np.int16)
+            normalized = data
         
-        # Build the data string - comma-separated integer values
-        data_str = ",".join(str(int(v)) for v in dac_data)
+        # Convert to unsigned 14-bit DAC values: 0x0000-0x3FFF (0-16383)
+        # -1.0 -> 0x0000 (0), 0.0 -> 0x2000 (8192), +1.0 -> 0x3FFF (16383)
+        dac_data = np.round((normalized + 1.0) / 2.0 * 16383).astype(np.uint16)
+        dac_data = np.clip(dac_data, 0, 0x3FFF)
         
-        # Upload to volatile memory
-        # Command: :SOURce[<n>]:DATA:DAC16 VOLATILE,<name>,<binary_data>
-        # For simplicity, we use the ASCII DATA command
-        cmd = f":SOURce{channel}:DATA VOLATILE,{data_str}"
+        # Build IEEE 488.2 binary block
+        # Each point is 2 bytes (little-endian unsigned 16-bit)
+        binary_data = struct.pack(f'<{len(dac_data)}H', *dac_data)
+        byte_count = len(binary_data)
+        byte_count_str = str(byte_count)
+        num_digits = len(byte_count_str)
         
-        if not self._conn.write(cmd):
+        # Build the full command as bytes:
+        # :SOURce<n>:TRACe:DATA:DAC16 VOLATILE,END,#<num_digits><byte_count><binary_data>\n
+        header = f":SOURce{channel}:TRACe:DATA:DAC16 VOLATILE,END,"
+        block_header = f"#{num_digits}{byte_count_str}"
+        
+        cmd_bytes = header.encode('ascii') + block_header.encode('ascii') + binary_data + b'\n'
+        
+        print(f"Uploading {len(dac_data)} points ({byte_count} bytes) to CH{channel}...")
+        
+        if not self._conn.write_raw(cmd_bytes):
             print("Error: Failed to upload waveform data")
             return False
         
-        # Set the arbitrary waveform name
-        # Note: The name might need to be set differently on non-Pro models
-        # cmd_name = f":SOURce{channel}:FUNCtion:ARBitrary {name}"
-        # self._conn.write(cmd_name)
+        # Wait for upload to complete
+        import time
+        time.sleep(0.5)
         
+        # Verify with *OPC?
+        opc = self._conn.query("*OPC?")
+        if opc != '1':
+            print(f"Warning: OPC returned {opc}")
+        
+        print("Upload complete. Device should auto-switch to arbitrary output.")
         return True
     
     def upload_arbitrary_waveform_from_object(self, channel: int,
@@ -613,18 +681,22 @@ class DG822Waveform:
         
         return self.upload_arbitrary_waveform(channel, waveform.name, waveform.data)
     
-    def set_arbitrary_waveform(self, channel: int, name: str) -> bool:
+    def set_arbitrary_waveform(self, channel: int, name: str = "USER") -> bool:
         """
-        Select a stored arbitrary waveform by name.
+        Select the user-uploaded arbitrary waveform.
+        
+        For DG800 (non-Pro), the uploaded volatile waveform is selected
+        using :FUNCtion USER. Note: The upload with flag=END should
+        auto-select, so this is a fallback.
         
         Args:
             channel: Output channel (1 or 2)
-            name: Name of the stored waveform
+            name: Waveform name (default "USER" for volatile waveform)
             
         Returns:
             True if successful
         """
-        cmd = f":SOURce{channel}:FUNCtion:ARBitrary {name}"
+        cmd = f":SOURce{channel}:FUNCtion USER"
         return self._conn.write(cmd)
     
     def get_arbitrary_waveform(self, channel: int = 1) -> Optional[str]:
@@ -664,6 +736,87 @@ class DG822Waveform:
         """
         cmd = f":SOURce{channel}:DATA:DELete {name}"
         return self._conn.write(cmd)
+    
+    def store_arb_file(self, filename: str, directory: str = 'C:\\') -> bool:
+        """
+        Save the current channel's arbitrary waveform to internal memory as .RAF.
+        
+        Must be called after uploading waveform data via upload_arbitrary_waveform.
+        The filename must be max 7 characters (excluding .RAF extension).
+        
+        Args:
+            filename: Name for the file (e.g. "SQUARE" -> saved as SQUARE.RAF)
+            directory: Directory to save to (default "C:\\" for internal memory)
+            
+        Returns:
+            True if successful
+        """
+        import time
+        
+        # Ensure .RAF extension
+        if not filename.upper().endswith('.RAF'):
+            filename = filename[:7] + '.RAF'
+        
+        # Navigate to the target directory
+        self._conn.write(f':MMEMory:CDIRectory "{directory}"')
+        time.sleep(0.3)
+        
+        # Store the arb data (no channel number — DG822 doesn't support it)
+        cmd = f':MMEMory:STORe:DATA "{filename}"'
+        if not self._conn.write(cmd):
+            print(f"Error: Failed to store arb file {filename}")
+            return False
+        
+        time.sleep(0.5)
+        print(f"Saved arb waveform to {directory}{filename}")
+        return True
+    
+    def load_arb_file(self, filename: str, directory: str = 'C:\\') -> bool:
+        """
+        Load an arbitrary waveform .RAF file from internal memory into
+        the current channel.
+        
+        Args:
+            filename: Name of the file (e.g. "SQUARE.RAF")
+            directory: Directory to load from (default "C:\\" for internal memory)
+            
+        Returns:
+            True if successful
+        """
+        import time
+        
+        # Ensure .RAF extension
+        if not filename.upper().endswith('.RAF'):
+            filename = filename + '.RAF'
+        
+        # Navigate to the target directory
+        self._conn.write(f':MMEMory:CDIRectory "{directory}"')
+        time.sleep(0.3)
+        
+        # Load the arb data (no channel number)
+        cmd = f':MMEMory:LOAD:DATA "{filename}"'
+        if not self._conn.write(cmd):
+            print(f"Error: Failed to load arb file {filename}")
+            return False
+        
+        time.sleep(0.5)
+        print(f"Loaded arb waveform from {directory}{filename}")
+        return True
+    
+    def list_arb_files(self, directory: str = 'C:\\') -> Optional[str]:
+        """
+        List .RAF arbitrary waveform files in the specified directory.
+        
+        Args:
+            directory: Directory to list (default "C:\\" for internal memory)
+            
+        Returns:
+            Catalog string from the device
+        """
+        import time
+        self._conn.write(f':MMEMory:CDIRectory "{directory}"')
+        time.sleep(0.3)
+        return self._conn.query(':MMEMory:CATalog:DATA:ARBitrary?')
 
 
 # =============================================================================

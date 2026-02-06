@@ -10,9 +10,202 @@ Date: 2026-01-09
 """
 
 import numpy as np
+from math import gcd
+from functools import reduce
 from typing import Optional, List, Tuple, Union
 from pathlib import Path
 import struct
+
+
+# =============================================================================
+# DG822 Hardware Constants
+# =============================================================================
+DG822_MIN_POINTS = 8
+DG822_MAX_POINTS = 16384
+DG822_MIN_SAMPLE_RATE = 2e3      # 2 kSa/s
+DG822_MAX_SAMPLE_RATE = 30e6     # 30 MSa/s
+# Minimum points per cycle of highest frequency for smooth waveform
+MIN_POINTS_PER_CYCLE = 10
+
+
+def compute_optimal_points(frequency: float) -> int:
+    """
+    Compute the optimal (maximum) number of waveform points for a given
+    output frequency, maximizing smoothness within hardware limits.
+
+    output_frequency = sample_rate / num_points
+    => sample_rate = frequency * num_points
+    => max num_points = DG822_MAX_SAMPLE_RATE / frequency  (capped at 16384)
+
+    Args:
+        frequency: Desired output frequency in Hz
+
+    Returns:
+        Optimal number of points (8–16384)
+    """
+    if frequency <= 0:
+        return DG822_MAX_POINTS
+    max_pts = int(DG822_MAX_SAMPLE_RATE / frequency)
+    return max(DG822_MIN_POINTS, min(max_pts, DG822_MAX_POINTS))
+
+
+def compute_optimal_points_for_comb(frequencies: List[float]) -> Tuple[int, dict]:
+    """
+    Compute the optimal number of waveform points for a frequency comb,
+    ensuring the highest-frequency component is smoothly represented.
+
+    The waveform period = 1 / fundamental, where fundamental ≈ GCD of all
+    frequencies.  Within that period the highest comb tone completes
+    f_max / f_fundamental cycles, each needing ≥ MIN_POINTS_PER_CYCLE
+    points for smooth rendering.
+
+    Args:
+        frequencies: List of comb frequencies in Hz
+
+    Returns:
+        (num_points, info_dict) where info_dict contains:
+            - 'fundamental': the fundamental frequency (Hz)
+            - 'f_max': highest comb frequency (Hz)
+            - 'harmonics': f_max / fundamental (cycles in one period)
+            - 'min_points_needed': minimum points for smooth highest harmonic
+            - 'max_points_available': max points before exceeding sample rate
+            - 'sample_rate': resulting sample rate
+            - 'warning': string warning or None
+    """
+    freqs = np.array(frequencies, dtype=float)
+    if len(freqs) == 0:
+        raise ValueError("No frequencies specified")
+    if np.any(freqs <= 0):
+        raise ValueError("All frequencies must be positive")
+
+    fundamental = _approximate_gcd(freqs)
+    f_max = np.max(freqs)
+    harmonics = f_max / fundamental  # cycles of f_max per waveform period
+
+    # Minimum points to represent highest harmonic smoothly
+    min_points_needed = int(np.ceil(harmonics * MIN_POINTS_PER_CYCLE))
+
+    # Maximum points before sample rate exceeds 30 MSa/s
+    max_points_available = int(DG822_MAX_SAMPLE_RATE / fundamental)
+
+    # Choose: as many points as possible, but capped at 16384
+    optimal = min(max_points_available, DG822_MAX_POINTS)
+    optimal = max(optimal, DG822_MIN_POINTS)
+
+    warning = None
+    if min_points_needed > DG822_MAX_POINTS:
+        warning = (
+            f"Frequency span too wide for smooth output.\n"
+            f"The highest tone ({f_max:.4g} Hz) needs ~{min_points_needed} points "
+            f"within a {fundamental:.4g} Hz fundamental period,\n"
+            f"but the DG822 maximum is {DG822_MAX_POINTS}.\n"
+            f"The highest harmonics will appear coarse/aliased.\n"
+            f"Consider narrowing the frequency range or increasing the step size."
+        )
+    elif optimal < min_points_needed:
+        warning = (
+            f"Sample-rate limited: only {optimal} points achievable "
+            f"(need {min_points_needed} for smooth output).\n"
+            f"Highest harmonics may appear coarse."
+        )
+
+    # Also check if fundamental is too low for minimum sample rate
+    if optimal * fundamental < DG822_MIN_SAMPLE_RATE:
+        # Need to raise optimal so sample rate ≥ 2 kSa/s
+        min_pts_for_sr = int(np.ceil(DG822_MIN_SAMPLE_RATE / fundamental))
+        if min_pts_for_sr > DG822_MAX_POINTS:
+            warning = (
+                f"Fundamental frequency {fundamental:.4g} Hz is too low.\n"
+                f"Cannot achieve minimum sample rate of {DG822_MIN_SAMPLE_RATE/1e3:.0f} kSa/s "
+                f"within {DG822_MAX_POINTS} points."
+            )
+        else:
+            optimal = max(optimal, min_pts_for_sr)
+
+    sample_rate = optimal * fundamental
+
+    info = {
+        'fundamental': fundamental,
+        'f_max': f_max,
+        'harmonics': harmonics,
+        'min_points_needed': min_points_needed,
+        'max_points_available': min(max_points_available, DG822_MAX_POINTS),
+        'num_points': optimal,
+        'sample_rate': sample_rate,
+        'warning': warning,
+    }
+    return optimal, info
+
+
+def check_frequency_feasibility(frequency: float, num_points: int = None) -> dict:
+    """
+    Check whether a given output frequency is achievable and return info.
+
+    Args:
+        frequency: Desired output frequency in Hz
+        num_points: Number of points (if None, uses optimal)
+
+    Returns:
+        dict with 'achievable', 'sample_rate', 'num_points', 'warning', etc.
+    """
+    if num_points is None:
+        num_points = compute_optimal_points(frequency)
+
+    sample_rate = frequency * num_points
+    achievable = DG822_MIN_SAMPLE_RATE <= sample_rate <= DG822_MAX_SAMPLE_RATE
+    warning = None
+
+    if sample_rate < DG822_MIN_SAMPLE_RATE:
+        min_freq = DG822_MIN_SAMPLE_RATE / num_points
+        warning = (
+            f"Frequency too low for {num_points} points.\n"
+            f"Minimum achievable: {min_freq:.4g} Hz"
+        )
+    elif sample_rate > DG822_MAX_SAMPLE_RATE:
+        max_freq = DG822_MAX_SAMPLE_RATE / num_points
+        warning = (
+            f"Frequency too high for {num_points} points.\n"
+            f"Maximum achievable: {max_freq:.4g} Hz"
+        )
+
+    return {
+        'achievable': achievable,
+        'sample_rate': sample_rate,
+        'num_points': num_points,
+        'frequency': frequency,
+        'warning': warning,
+    }
+
+
+def _approximate_gcd(values: np.ndarray, tolerance: float = 1e-6) -> float:
+    """
+    Compute an approximate GCD of a list of float frequencies.
+
+    Uses integer-scaled GCD: multiply all values to make them integers,
+    compute GCD, scale back.  Falls back to the minimum value if the
+    result is unreasonably small (< tolerance * min).
+    """
+    if len(values) == 1:
+        return float(values[0])
+
+    # Scale to integers (handle decimals by multiplying up)
+    # Find smallest decimal precision needed
+    scale = 1.0
+    for v in values:
+        s = f"{v:.10g}"
+        if '.' in s:
+            decimals = len(s.split('.')[1])
+            scale = max(scale, 10 ** decimals)
+
+    int_values = np.round(values * scale).astype(int)
+    g = reduce(gcd, int_values)
+    result = g / scale
+
+    # Sanity check: if GCD is unreasonably small, use min frequency
+    if result < float(np.min(values)) * tolerance:
+        result = float(np.min(values))
+
+    return float(result)
 
 
 class ArbitraryWaveform:
@@ -514,44 +707,55 @@ class WaveformGenerator:
     @staticmethod
     def frequency_comb(frequencies: List[float] = None,
                        start_freq: float = None, stop_freq: float = None, step_freq: float = None,
-                       num_points: int = 16384,
+                       num_points: int = None,
                        random_phases: bool = True,
                        monte_carlo_iterations: int = 1000) -> ArbitraryWaveform:
         """
         Generate a frequency comb waveform (sum of sinusoids).
         
-        The waveform represents one period of the fundamental (lowest frequency).
-        Each frequency component is a harmonic of this fundamental.
+        The waveform represents one period of the fundamental (GCD of all
+        frequencies).  If num_points is None, the optimal number is computed
+        automatically to maximise smoothness within hardware limits.
         
         Args:
             frequencies: List of frequencies in Hz. If None, use start/stop/step.
             start_freq: Starting frequency for arange-style input
             stop_freq: Stopping frequency for arange-style input  
             step_freq: Step size for arange-style input
-            num_points: Number of points in waveform
+            num_points: Number of points (None = auto-optimal)
             random_phases: If True, use random phases (with Monte Carlo optimization)
                           If False, all phases are zero
             monte_carlo_iterations: Number of random phase sets to try (if random_phases=True)
             
         Returns:
-            ArbitraryWaveform object with optimized frequency comb
+            ArbitraryWaveform object with optimized frequency comb.
+            The returned object has extra attributes:
+              .comb_frequencies, .comb_phases, .comb_info (dict)
         """
         # Determine frequencies
         if frequencies is not None:
-            freqs = np.array(frequencies)
+            freqs = np.array(frequencies, dtype=float)
         elif start_freq is not None and stop_freq is not None and step_freq is not None:
             freqs = np.arange(start_freq, stop_freq + step_freq/2, step_freq)
         else:
             # Default: 1 to 10 Hz in 1 Hz steps
-            freqs = np.arange(1, 11, 1)
+            freqs = np.arange(1, 11, 1, dtype=float)
         
         if len(freqs) == 0:
             raise ValueError("No frequencies specified")
-        
-        # Fundamental frequency is the GCD of all frequencies (or just use lowest)
-        fundamental = np.min(freqs)
-        if fundamental <= 0:
+        if np.any(freqs <= 0):
             raise ValueError("All frequencies must be positive")
+        
+        # Auto-calculate optimal points if not specified
+        optimal_pts, comb_info = compute_optimal_points_for_comb(freqs.tolist())
+        if num_points is None:
+            num_points = optimal_pts
+        else:
+            # User specified — just update the info dict
+            comb_info['num_points'] = num_points
+            comb_info['sample_rate'] = num_points * comb_info['fundamental']
+
+        fundamental = comb_info['fundamental']
         
         # Time array for one period of the fundamental
         t = np.linspace(0, 1/fundamental, num_points, endpoint=False)
@@ -589,6 +793,7 @@ class WaveformGenerator:
             # All phases zero
             phases = np.zeros(len(freqs))
             data = generate_comb(phases)
+            best_phases = phases
             phase_desc = "zero"
         
         # Normalize to -1 to +1
@@ -600,11 +805,15 @@ class WaveformGenerator:
         wf.set_data_normalized(data)
         
         freq_range = f"{freqs[0]:.1f}-{freqs[-1]:.1f} Hz" if len(freqs) > 1 else f"{freqs[0]:.1f} Hz"
-        wf.description = f"Frequency comb: {len(freqs)} tones, {freq_range}, {phase_desc}"
+        wf.description = (
+            f"Frequency comb: {len(freqs)} tones, {freq_range}, {phase_desc}, "
+            f"{num_points} pts (f0={fundamental:.4g} Hz)"
+        )
         
         # Store metadata for reference
         wf.comb_frequencies = freqs.tolist()
-        wf.comb_phases = best_phases.tolist() if random_phases else [0.0] * len(freqs)
+        wf.comb_phases = best_phases.tolist()
+        wf.comb_info = comb_info
         
         return wf
 
