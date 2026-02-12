@@ -188,14 +188,17 @@ class DG822Waveform:
         Set parameters for the currently loaded arbitrary waveform.
         
         On the DG822, uploading via DATA:DAC16 VOLATILE,END auto-switches
-        the device to SEQUENCE mode. We must NOT call :APPLy:USER or
-        :FUNCtion USER as those reset to the built-in SINC waveform.
+        the device to an arbitrary waveform mode.  Depending on the firmware
+        version this may be SEQUENCE mode (firmware ≤ 00.01.x) or USER mode
+        (firmware ≥ 00.02.x).
         
-        Instead, we set the sample rate (which controls output frequency)
-        and individual amplitude/offset/phase parameters.
+        We must NOT call :APPLy:USER or :FUNCtion USER as those reset the
+        waveform to the built-in SINC on some firmware versions.
         
-        Output frequency = sample_rate / num_points
-        So: sample_rate = frequency * num_points
+        To control the output frequency we use a two-pronged approach:
+          1. Set :FREQuency directly (works in USER mode, firmware 00.02.x)
+          2. Set :FUNCtion:SEQuence:SRATe (works in SEQUENCE mode, firmware 00.01.x)
+        Both are attempted; the instrument silently ignores the irrelevant one.
         
         Args:
             channel: Output channel (1 or 2)
@@ -211,17 +214,43 @@ class DG822Waveform:
         import time
         success = True
         
-        # Set sample rate to achieve desired frequency
-        # sample_rate = frequency * num_points
+        # Detect current arb mode to know which frequency method applies
+        current_mode = self.get_function(channel) or ""
+        is_user_mode = "USER" in current_mode.upper()
+        is_seq_mode = "SEQ" in current_mode.upper()
+        print(f"[apply_arbitrary] CH{channel}: mode={current_mode}, "
+              f"freq={frequency}, pts={num_points}")
+        
+        # --- Set output frequency ---
         if num_points and num_points > 0:
-            sample_rate = frequency * num_points
-            # DG822 sample rate range: 2 kSa/s to 30 MSa/s
-            sample_rate = max(2000, min(sample_rate, 30e6))
-            cmd_sr = f":SOURce{channel}:FUNCtion:SEQuence:SRATe {sample_rate}"
-            if not self._conn.write(cmd_sr):
-                print(f"Warning: Failed to set sample rate to {sample_rate}")
-                success = False
-            time.sleep(0.1)
+            if is_user_mode:
+                # Firmware 00.02.x (USER mode): set frequency directly
+                cmd_freq = f":SOURce{channel}:FREQuency {frequency}"
+                if not self._conn.write(cmd_freq):
+                    print(f"Warning: Failed to set frequency to {frequency}")
+                    success = False
+                time.sleep(0.1)
+            elif is_seq_mode:
+                # Firmware 00.01.x (SEQUENCE mode): set sample rate
+                sample_rate = frequency * num_points
+                sample_rate = max(2000, min(sample_rate, 30e6))
+                cmd_sr = f":SOURce{channel}:FUNCtion:SEQuence:SRATe {sample_rate}"
+                if not self._conn.write(cmd_sr):
+                    print(f"Warning: Failed to set sample rate to {sample_rate}")
+                    success = False
+                time.sleep(0.1)
+            else:
+                # Unknown mode — try both approaches
+                print(f"Warning: Unexpected arb mode '{current_mode}', "
+                      f"trying both frequency methods")
+                self._conn.write(f":SOURce{channel}:FREQuency {frequency}")
+                time.sleep(0.05)
+                if num_points > 0:
+                    sample_rate = frequency * num_points
+                    sample_rate = max(2000, min(sample_rate, 30e6))
+                    self._conn.write(
+                        f":SOURce{channel}:FUNCtion:SEQuence:SRATe {sample_rate}")
+                time.sleep(0.1)
         
         # Set amplitude
         cmd_amp = f":SOURce{channel}:VOLTage {amplitude}"
@@ -614,9 +643,10 @@ class DG822Waveform:
         import numpy as np
         import struct
         
-        # Validate data length (8 to 16384 points per DG800 guide)
-        if len(data) < 8 or len(data) > 16384:
-            print(f"Error: Data length must be 8-16384 points (got {len(data)})")
+        # Validate data length (8 to 8192 points; firmware 00.02.x rejects
+        # single-packet DAC16 > 8192 pts and CON/END chunking is unreliable)
+        if len(data) < 8 or len(data) > 8192:
+            print(f"Error: Data length must be 8-8192 points (got {len(data)})")
             return False
         
         # Normalize data to -1..+1 range first
@@ -631,34 +661,36 @@ class DG822Waveform:
         dac_data = np.round((normalized + 1.0) / 2.0 * 16383).astype(np.uint16)
         dac_data = np.clip(dac_data, 0, 0x3FFF)
         
-        # Build IEEE 488.2 binary block
         # Each point is 2 bytes (little-endian unsigned 16-bit)
         binary_data = struct.pack(f'<{len(dac_data)}H', *dac_data)
+        n_points = len(dac_data)
+        
+        import time
+        
+        # Build single END packet (always ≤ 8192 pts after validation)
         byte_count = len(binary_data)
         byte_count_str = str(byte_count)
         num_digits = len(byte_count_str)
-        
-        # Build the full command as bytes:
-        # :SOURce<n>:TRACe:DATA:DAC16 VOLATILE,END,#<num_digits><byte_count><binary_data>\n
         header = f":SOURce{channel}:TRACe:DATA:DAC16 VOLATILE,END,"
         block_header = f"#{num_digits}{byte_count_str}"
-        
         cmd_bytes = header.encode('ascii') + block_header.encode('ascii') + binary_data + b'\n'
         
-        print(f"Uploading {len(dac_data)} points ({byte_count} bytes) to CH{channel}...")
+        print(f"Uploading {n_points} points ({byte_count} bytes) to CH{channel}...")
         
         if not self._conn.write_raw(cmd_bytes):
             print("Error: Failed to upload waveform data")
             return False
-        
-        # Wait for upload to complete
-        import time
         time.sleep(0.5)
         
         # Verify with *OPC?
         opc = self._conn.query("*OPC?")
         if opc != '1':
             print(f"Warning: OPC returned {opc}")
+        
+        # Check for instrument errors
+        err = self._conn.query(":SYSTem:ERRor?")
+        if err and not err.startswith('0,'):
+            print(f"Warning: Instrument error after upload: {err}")
         
         print("Upload complete. Device should auto-switch to arbitrary output.")
         return True

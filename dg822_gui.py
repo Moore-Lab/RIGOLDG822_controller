@@ -21,8 +21,8 @@ from dg822_plot import WaveformPlotter
 from dg822_arbitrarywf import (
     ArbitraryWaveform, WaveformGenerator,
     compute_optimal_points, compute_optimal_points_for_comb,
-    check_frequency_feasibility, DG822_MAX_POINTS, DG822_MAX_SAMPLE_RATE,
-    DG822_MIN_SAMPLE_RATE,
+    check_frequency_feasibility, DG822_MIN_POINTS, DG822_MAX_POINTS,
+    DG822_MAX_SAMPLE_RATE, DG822_MIN_SAMPLE_RATE,
 )
 
 
@@ -515,12 +515,10 @@ class ChannelFrame(ttk.LabelFrame):
         """Handle waveform type change - show/hide relevant parameters."""
         wf = self.waveform_var.get()
         
-        # Show/hide frequency (not applicable to Noise, DC, or comb arb)
-        is_comb = (wf == "Arbitrary"
-                   and self.arb_waveform is not None
-                   and hasattr(self.arb_waveform, 'comb_info')
-                   and self.arb_waveform.comb_info)
-        freq_disabled = wf in ["Noise", "DC"] or is_comb
+        # Show/hide frequency (not applicable to Noise, DC, or Arbitrary)
+        # For ALL arb waveforms (comb or not), frequency is set by the arb dialog
+        is_arb = (wf == "Arbitrary" and self.arb_waveform is not None)
+        freq_disabled = wf in ["Noise", "DC"] or is_arb
         self.freq_entry.config(state="disabled" if freq_disabled else "normal")
         self.freq_unit.config(state="disabled" if freq_disabled else "readonly")
         
@@ -564,9 +562,13 @@ class ChannelFrame(ttk.LabelFrame):
                 self.freq_hint_label.config(
                     text=f"(comb fundamental: {f0:.4g} Hz)",
                     foreground="blue")
+            elif self.arb_waveform is not None:
+                self.freq_hint_label.config(
+                    text=f"(set by arb dialog)",
+                    foreground="blue")
             else:
                 self.freq_hint_label.config(
-                    text="(sets output repetition rate)",
+                    text="(generate or load an arb waveform first)",
                     foreground="gray")
         else:
             self.arb_frame.grid_remove()
@@ -760,11 +762,20 @@ class ChannelFrame(ttk.LabelFrame):
                     if not self.arb_waveform.name:
                         self.arb_waveform.name = "CUSTOM"
                     
+                    num_pts = len(self.arb_waveform.data)
+                    print(f"[APPLY ARB] CH{self.channel}: {num_pts} pts, freq={freq}")
+                    
                     # Upload arbitrary waveform (binary DAC16 format)
                     # The upload with flag=END auto-switches device to SEQUENCE mode
                     if not controller.waveform.upload_arbitrary_waveform_from_object(self.channel, self.arb_waveform):
                         messagebox.showerror("Error", "Failed to upload arbitrary waveform.")
                         return
+                    
+                    # Verify instrument switched to SEQUENCE mode
+                    import time
+                    time.sleep(0.2)
+                    mode_after = controller.waveform.get_function(self.channel)
+                    print(f"[APPLY ARB] Mode after upload: {mode_after}")
                     
                     # Save to internal memory as .RAF file
                     raf_name = self.arb_waveform.name[:7]  # Max 7 chars
@@ -773,17 +784,23 @@ class ChannelFrame(ttk.LabelFrame):
                     # Determine the output frequency:
                     #  - For frequency combs: use the fundamental (comb repetition rate)
                     #  - For other shapes:    use the frequency from the main controls
-                    num_pts = len(self.arb_waveform.data)
                     if hasattr(self.arb_waveform, 'comb_info') and self.arb_waveform.comb_info:
                         arb_freq = self.arb_waveform.comb_info['fundamental']
                     else:
                         arb_freq = freq
+                    
+                    sample_rate = arb_freq * num_pts
+                    print(f"[APPLY ARB] apply_arbitrary: freq={arb_freq}, "
+                          f"pts={num_pts}, sample_rate={sample_rate}")
                     
                     # Set parameters (sample rate, amplitude, offset, phase)
                     # Do NOT call :APPLy:USER — that resets to built-in SINC!
                     success = controller.waveform.apply_arbitrary(
                         self.channel, arb_freq, amp, offset, phase, num_points=num_pts
                     )
+                    
+                    mode_final = controller.waveform.get_function(self.channel)
+                    print(f"[APPLY ARB] Mode final: {mode_final}")
                 else:
                     messagebox.showwarning("No Waveform", "Please load or generate an arbitrary waveform first.")
                     return
@@ -976,9 +993,20 @@ class ChannelFrame(ttk.LabelFrame):
         
         if filepath:
             try:
-                self.arb_waveform.save_csv(filepath)
+                # Get amplitude from GUI for file headers
+                try:
+                    amp_vpp = float(self.amp_var.get())
+                except (ValueError, AttributeError):
+                    amp_vpp = 10.0
+                
+                self.arb_waveform.save_csv(filepath, amplitude_vpp=amp_vpp)
+                # Also save a .raf (Rigol binary) file alongside the CSV
+                import os
+                raf_path = os.path.splitext(filepath)[0] + '.raf'
+                self.arb_waveform.save_binary(raf_path, amplitude_vpp=amp_vpp)
                 self.arb_file_var.set(f"Saved: {name}")
-                messagebox.showinfo("Success", f"Saved waveform to {filepath}")
+                messagebox.showinfo("Success", 
+                    f"Saved waveform to:\n{filepath}\n{raf_path}")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to save waveform: {e}")
     
@@ -993,30 +1021,48 @@ class ChannelFrame(ttk.LabelFrame):
             pts = len(self.arb_waveform.data)
             self.arb_file_var.set(f"Generated: {dialog.waveform_type} ({pts} pts)")
             
-            # For frequency combs: auto-set the frequency box to the fundamental
+            # Auto-set the frequency box based on the dialog's output frequency
             if (hasattr(self.arb_waveform, 'comb_info') 
                     and self.arb_waveform.comb_info):
+                # Frequency comb: use fundamental
                 f0 = self.arb_waveform.comb_info['fundamental']
-                # Set frequency box to fundamental
-                if f0 >= 1e6:
-                    self.freq_var.set(f"{f0/1e6:.6g}")
-                    self.freq_unit_var.set("MHz")
-                elif f0 >= 1e3:
-                    self.freq_var.set(f"{f0/1e3:.6g}")
-                    self.freq_unit_var.set("kHz")
-                else:
-                    self.freq_var.set(f"{f0:.6g}")
-                    self.freq_unit_var.set("Hz")
+                self._set_freq_box(f0)
                 self.freq_hint_label.config(
                     text=f"(comb fundamental: {f0:.4g} Hz)",
                     foreground="blue")
                 # Disable freq entry — comb fundamental is fixed
                 self.freq_entry.config(state="disabled")
                 self.freq_unit.config(state="disabled")
+            else:
+                # Non-comb arb: use the dialog's computed output frequency
+                f0 = dialog.dialog_output_frequency
+                self._set_freq_box(f0)
+                self.freq_hint_label.config(
+                    text=f"(arb output: {f0:.4g} Hz)",
+                    foreground="blue")
+                # Disable freq entry — frequency is set by the arb dialog
+                self.freq_entry.config(state="disabled")
+                self.freq_unit.config(state="disabled")
+            
+            print(f"[GENERATE ARB] type={dialog.waveform_type}, pts={pts}, "
+                  f"freq={f0:.4g} Hz, freq_var='{self.freq_var.get()}' "
+                  f"{self.freq_unit_var.get()}")
             
             messagebox.showinfo("Success", 
                 f"Generated {dialog.waveform_type} with {pts} points")
             self._update_plot()
+    
+    def _set_freq_box(self, freq_hz: float):
+        """Set the frequency entry box to a given value in Hz, choosing the best unit."""
+        if freq_hz >= 1e6:
+            self.freq_var.set(f"{freq_hz/1e6:.6g}")
+            self.freq_unit_var.set("MHz")
+        elif freq_hz >= 1e3:
+            self.freq_var.set(f"{freq_hz/1e3:.6g}")
+            self.freq_unit_var.set("kHz")
+        else:
+            self.freq_var.set(f"{freq_hz:.6g}")
+            self.freq_unit_var.set("Hz")
     
     def _upload_arb(self):
         """Upload the current arbitrary waveform to the instrument."""
@@ -1038,8 +1084,41 @@ class ChannelFrame(ttk.LabelFrame):
             if name:
                 self.arb_waveform.name = name[:7]
                 
-                # Upload to volatile memory (auto-switches to SEQUENCE mode)
-                if controller.waveform.upload_arbitrary_waveform_from_object(self.channel, self.arb_waveform):
+                num_pts = len(self.arb_waveform.data)
+                print(f"[ARB UPLOAD] CH{self.channel}: {num_pts} pts, "
+                      f"data range [{self.arb_waveform.data.min():.3f}, "
+                      f"{self.arb_waveform.data.max():.3f}]")
+                
+                # Query instrument mode BEFORE upload
+                mode_before = controller.waveform.get_function(self.channel)
+                print(f"[ARB UPLOAD] Mode BEFORE upload: {mode_before}")
+                
+                # Switch to SIN first to clear the volatile arb buffer.
+                # On firmware 00.02.x the DDRIII memory retains old data
+                # and a new DAC16 upload can be composited with stale data.
+                import time
+                if mode_before and mode_before.upper() in ('USER', 'SEQUENCE'):
+                    from dg822_waveform import WaveformType
+                    controller.waveform.set_function(self.channel, WaveformType.SINE)
+                    time.sleep(0.3)
+                    print(f"[ARB UPLOAD] Cleared arb buffer (switched to SIN)")
+                
+                # Upload to volatile memory (auto-switches to USER mode)
+                upload_ok = controller.waveform.upload_arbitrary_waveform_from_object(
+                    self.channel, self.arb_waveform)
+                print(f"[ARB UPLOAD] upload_arbitrary_waveform_from_object returned: {upload_ok}")
+                
+                if upload_ok:
+                    # Verify instrument switched to SEQUENCE mode
+                    import time
+                    time.sleep(0.2)
+                    mode_after = controller.waveform.get_function(self.channel)
+                    print(f"[ARB UPLOAD] Mode AFTER upload: {mode_after}")
+                    
+                    if mode_after and 'SEQ' not in mode_after.upper():
+                        print(f"[ARB UPLOAD] WARNING: Instrument did NOT switch to "
+                              f"SEQUENCE mode! Got: {mode_after}")
+                    
                     # Save to internal memory as .RAF file
                     raf_name = self.arb_waveform.name[:7]
                     controller.waveform.store_arb_file(raf_name)
@@ -1050,11 +1129,15 @@ class ChannelFrame(ttk.LabelFrame):
                         amp = float(self.amp_var.get())
                         offset = float(self.offset_var.get())
                         phase = float(self.phase_var.get())
-                        num_pts = len(self.arb_waveform.data)
                         
                         # For frequency combs use the fundamental as output freq
                         if hasattr(self.arb_waveform, 'comb_info') and self.arb_waveform.comb_info:
                             freq = self.arb_waveform.comb_info['fundamental']
+                        
+                        sample_rate = freq * num_pts
+                        print(f"[ARB UPLOAD] apply_arbitrary: freq={freq} Hz, "
+                              f"pts={num_pts}, sample_rate={sample_rate}, "
+                              f"amp={amp}, offset={offset}, phase={phase}")
                         
                         controller.waveform.apply_arbitrary(
                             self.channel, freq, amp, offset, phase, num_points=num_pts
@@ -1062,13 +1145,18 @@ class ChannelFrame(ttk.LabelFrame):
                     except Exception as e:
                         print(f"Warning: Could not set arb parameters: {e}")
                     
+                    # Verify mode is still SEQUENCE after apply
+                    mode_final = controller.waveform.get_function(self.channel)
+                    print(f"[ARB UPLOAD] Mode FINAL (after apply): {mode_final}")
+                    
                     # Keep GUI on Arbitrary view
                     self.waveform_var.set("Arbitrary")
                     self._on_waveform_change()
                     self._update_plot()
                     
                     messagebox.showinfo("Success", 
-                        f"Uploaded and saved '{raf_name}.RAF' to CH{self.channel}")
+                        f"Uploaded and saved '{raf_name}.RAF' to CH{self.channel}\n"
+                        f"Mode: {mode_final}")
                 else:
                     messagebox.showerror("Error", "Failed to upload waveform to instrument.")
         except Exception as e:
@@ -1082,24 +1170,66 @@ class ArbGeneratorDialog(tk.Toplevel):
     smoothness within the DG822's hardware limits (8–16 384 points,
     sample rate 2 kSa/s – 30 MSa/s).
     
-    For basic shapes the output frequency from the main controls is used.
+    For basic shapes the dialog provides controls for polarity
+    (unipolar / bipolar) and drive mode (frequency-driven / time-driven).
     For frequency combs the fundamental (GCD of comb tones) drives the
     calculation and warnings are shown when the frequency span is too
     wide for the available point budget.
     """
+    
+    # Shape-specific parameter definitions.
+    # 'time' type gets unit dropdown; None default = compute from period.
+    # 'plain' type is a raw number (phase, lobes, etc.).
+    SHAPE_PARAMS = {
+        "square":      [("On Time", "time", None)],
+        "sine":        [("Phase (deg)", "plain", "0")],
+        "ramp":        [("Rise Time", "time", None)],
+        "trapezoid":   [("Rise Time", "time", None), ("Pulse Time", "time", None), ("Fall Time", "time", None)],
+        "pulse":       [("On Time", "time", None), ("Rise Time", "time", None), ("Fall Time", "time", None)],
+        "sinc":        [("Num Lobes", "plain", "5")],
+        "exponential": [("Time Constant", "time", None)],
+        "gaussian":    [("Std Dev", "time", None)],
+    }
+    
+    # Unit conversion tables
+    FREQ_UNITS = {"Hz": 1.0, "kHz": 1e3, "MHz": 1e6}
+    TIME_UNITS = {"s": 1.0, "ms": 1e-3, "µs": 1e-6}
+    # Reverse: raw seconds → best display unit
+    @staticmethod
+    def _best_time_unit(val_s):
+        if abs(val_s) < 1e-3:
+            return val_s / 1e-6, "µs"
+        elif abs(val_s) < 1.0:
+            return val_s / 1e-3, "ms"
+        return val_s, "s"
+    
+    @staticmethod
+    def _best_freq_unit(val_hz):
+        if abs(val_hz) >= 1e6:
+            return val_hz / 1e6, "MHz"
+        elif abs(val_hz) >= 1e3:
+            return val_hz / 1e3, "kHz"
+        return val_hz, "Hz"
     
     def __init__(self, parent, output_frequency: float = 1000.0):
         super().__init__(parent)
         self.title("Generate Arbitrary Waveform")
         self.result = None
         self.waveform_type = None
-        self.output_frequency = output_frequency  # Hz, from main controls
+        self.output_frequency = output_frequency
+        self.dialog_output_frequency = output_frequency
+        
+        self._last_drive_mode = "frequency"
+        self._last_polarity = "unipolar"
+        self._trap_pulse_override = False  # trapezoid: user specifies pulse time
         
         self.transient(parent)
         self.grab_set()
         
         self._create_widgets()
-        self._update_info()  # initial info display
+        self._rebuild_shape_params()
+        self._update_freq_controls()
+        self._update_info()
         
         # Center dialog
         self.update_idletasks()
@@ -1115,27 +1245,65 @@ class ArbGeneratorDialog(tk.Toplevel):
         ttk.Label(main_frame,
                   text="Generate a normalized waveform shape.\n"
                        "Points are auto-calculated for maximum smoothness.\n"
-                       "Frequency, amplitude, and offset are set in the main controls.",
+                       "Amplitude and offset are set in the main controls.",
                   justify="center").grid(row=0, column=0, columnspan=3, pady=10)
         
         # Waveform type
         ttk.Label(main_frame, text="Waveform Type:").grid(row=1, column=0, sticky="e", padx=5, pady=5)
         self.type_var = tk.StringVar(value="square")
         type_combo = ttk.Combobox(main_frame, textvariable=self.type_var, state="readonly",
-            values=["square", "sine", "ramp", "pulse", "sinc", "exponential", "gaussian", "frequency_comb"])
+            values=["square", "sine", "ramp", "trapezoid", "pulse", "sinc", "exponential", "gaussian", "frequency_comb"])
         type_combo.grid(row=1, column=1, columnspan=2, sticky="ew", padx=5, pady=5)
         type_combo.bind("<<ComboboxSelected>>", self._on_type_change)
         
-        # Duty/Symmetry (for basic waveforms)
-        self.duty_label = ttk.Label(main_frame, text="Duty/Symmetry (%):")
-        self.duty_label.grid(row=2, column=0, sticky="e", padx=5, pady=5)
-        self.duty_var = tk.StringVar(value="50")
-        self.duty_entry = ttk.Entry(main_frame, textvariable=self.duty_var, width=15)
-        self.duty_entry.grid(row=2, column=1, sticky="w", padx=5, pady=5)
+        # === Wave Properties Frame (hidden for combs) ===
+        self.wave_props_frame = ttk.LabelFrame(main_frame, text="Wave Properties", padding=5)
+        self.wave_props_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
+        
+        # Polarity
+        ttk.Label(self.wave_props_frame, text="Polarity:").grid(row=0, column=0, sticky="e", padx=5, pady=3)
+        self.polarity_var = tk.StringVar(value="unipolar")
+        ttk.Radiobutton(self.wave_props_frame, text="Unipolar", variable=self.polarity_var,
+                        value="unipolar", command=self._on_polarity_change).grid(row=0, column=1, sticky="w", padx=5)
+        ttk.Radiobutton(self.wave_props_frame, text="Bipolar", variable=self.polarity_var,
+                        value="bipolar", command=self._on_polarity_change).grid(row=0, column=2, sticky="w", padx=5)
+        
+        # Drive mode
+        ttk.Label(self.wave_props_frame, text="Drive Mode:").grid(row=1, column=0, sticky="e", padx=5, pady=3)
+        self.drive_mode_var = tk.StringVar(value="frequency")
+        ttk.Radiobutton(self.wave_props_frame, text="Frequency", variable=self.drive_mode_var,
+                        value="frequency", command=self._on_drive_mode_change).grid(row=1, column=1, sticky="w", padx=5)
+        ttk.Radiobutton(self.wave_props_frame, text="Time", variable=self.drive_mode_var,
+                        value="time", command=self._on_drive_mode_change).grid(row=1, column=2, sticky="w", padx=5)
+        
+        # Frequency / Period entry with unit dropdown
+        self.freq_time_label = ttk.Label(self.wave_props_frame, text="Frequency:")
+        self.freq_time_label.grid(row=2, column=0, sticky="e", padx=5, pady=3)
+        ft_frame = ttk.Frame(self.wave_props_frame)
+        ft_frame.grid(row=2, column=1, columnspan=2, sticky="w", padx=5, pady=3)
+        
+        disp_val, disp_unit = self._best_freq_unit(self.output_frequency)
+        self.freq_time_var = tk.StringVar(value=f"{disp_val:.6g}")
+        self.freq_time_entry = ttk.Entry(ft_frame, textvariable=self.freq_time_var, width=12)
+        self.freq_time_entry.pack(side="left")
+        self.freq_time_entry.bind("<KeyRelease>", lambda e: self._update_info())
+        
+        self.freq_time_unit_var = tk.StringVar(value=disp_unit)
+        self.freq_time_unit = ttk.Combobox(ft_frame, textvariable=self.freq_time_unit_var,
+                                           state="readonly", width=5,
+                                           values=["Hz", "kHz", "MHz"])
+        self.freq_time_unit.pack(side="left", padx=(3, 0))
+        self.freq_time_unit.bind("<<ComboboxSelected>>", lambda e: self._update_info())
+        
+        # === Shape Parameters Frame (dynamic, hidden for combs) ===
+        self.shape_frame = ttk.LabelFrame(main_frame, text="Shape Parameters", padding=5)
+        self.shape_frame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
+        self.shape_param_vars = []
+        self.shape_param_widgets = []
         
         # === Frequency Comb Frame ===
         self.comb_frame = ttk.LabelFrame(main_frame, text="Frequency Comb Settings", padding=5)
-        self.comb_frame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=5, pady=10)
+        self.comb_frame.grid(row=4, column=0, columnspan=3, sticky="ew", padx=5, pady=10)
         
         # Frequency input mode
         ttk.Label(self.comb_frame, text="Frequency Input:").grid(row=0, column=0, sticky="e", padx=5, pady=3)
@@ -1192,7 +1360,7 @@ class ArbGeneratorDialog(tk.Toplevel):
         
         # === Info / Warning Display ===
         self.info_frame = ttk.LabelFrame(main_frame, text="Waveform Info", padding=5)
-        self.info_frame.grid(row=4, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
+        self.info_frame.grid(row=5, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
         
         self.info_var = tk.StringVar(value="")
         self.info_label = ttk.Label(self.info_frame, textvariable=self.info_var,
@@ -1206,7 +1374,7 @@ class ArbGeneratorDialog(tk.Toplevel):
         
         # Buttons
         btn_frame = ttk.Frame(main_frame)
-        btn_frame.grid(row=5, column=0, columnspan=3, pady=10)
+        btn_frame.grid(row=6, column=0, columnspan=3, pady=10)
         
         ttk.Button(btn_frame, text="Generate", command=self._generate).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side="left", padx=5)
@@ -1215,14 +1383,235 @@ class ArbGeneratorDialog(tk.Toplevel):
         """Handle waveform type change."""
         wf_type = self.type_var.get()
         if wf_type == "frequency_comb":
-            self.duty_label.grid_remove()
-            self.duty_entry.grid_remove()
+            self.wave_props_frame.grid_remove()
+            self.shape_frame.grid_remove()
             self.comb_frame.grid()
         else:
-            self.duty_label.grid()
-            self.duty_entry.grid()
+            self.wave_props_frame.grid()
+            self.shape_frame.grid()
             self.comb_frame.grid_remove()
+            self._trap_pulse_override = False
+            self._rebuild_shape_params()
         self._update_info()
+    
+    def _on_polarity_change(self):
+        """Handle polarity toggle — convert freq/time entry to keep output freq constant."""
+        if self.drive_mode_var.get() == "time":
+            try:
+                val = float(self.freq_time_var.get())
+                unit_scale = self.TIME_UNITS[self.freq_time_unit_var.get()]
+                old_pol = self._last_polarity
+                new_pol = self.polarity_var.get()
+                if old_pol == "unipolar" and new_pol == "bipolar":
+                    self.freq_time_var.set(f"{val / 2:.6g}")
+                elif old_pol == "bipolar" and new_pol == "unipolar":
+                    self.freq_time_var.set(f"{val * 2:.6g}")
+            except (ValueError, ZeroDivisionError):
+                pass
+        self._last_polarity = self.polarity_var.get()
+        self._update_freq_controls()
+        self._rebuild_shape_params()
+        self._update_info()
+    
+    def _on_drive_mode_change(self):
+        """Handle drive mode toggle — convert between frequency and period."""
+        old_mode = self._last_drive_mode
+        new_mode = self.drive_mode_var.get()
+        try:
+            val = float(self.freq_time_var.get())
+            old_unit = self.freq_time_unit_var.get()
+            if val > 0:
+                if old_mode == "frequency" and new_mode == "time":
+                    freq_hz = val * self.FREQ_UNITS[old_unit]
+                    pol = self.polarity_var.get()
+                    period = 1.0 / freq_hz
+                    if pol == "bipolar":
+                        period /= 2.0
+                    disp, unit = self._best_time_unit(period)
+                    self.freq_time_var.set(f"{disp:.6g}")
+                    self.freq_time_unit_var.set(unit)
+                elif old_mode == "time" and new_mode == "frequency":
+                    period_s = val * self.TIME_UNITS[old_unit]
+                    pol = self.polarity_var.get()
+                    if pol == "bipolar":
+                        freq = 1.0 / (2.0 * period_s)
+                    else:
+                        freq = 1.0 / period_s
+                    disp, unit = self._best_freq_unit(freq)
+                    self.freq_time_var.set(f"{disp:.6g}")
+                    self.freq_time_unit_var.set(unit)
+        except (ValueError, ZeroDivisionError):
+            pass
+        self._last_drive_mode = new_mode
+        self._update_freq_controls()
+        self._update_info()
+    
+    def _update_freq_controls(self):
+        """Update the frequency/period label and unit dropdown based on drive mode & polarity."""
+        mode = self.drive_mode_var.get()
+        pol = self.polarity_var.get()
+        if mode == "frequency":
+            self.freq_time_label.config(text="Frequency:")
+            self.freq_time_unit.config(values=["Hz", "kHz", "MHz"])
+            if self.freq_time_unit_var.get() not in ("Hz", "kHz", "MHz"):
+                self.freq_time_unit_var.set("Hz")
+        else:
+            if pol == "unipolar":
+                self.freq_time_label.config(text="Period:")
+            else:
+                self.freq_time_label.config(text="Half Period:")
+            self.freq_time_unit.config(values=["µs", "ms", "s"])
+            if self.freq_time_unit_var.get() not in ("µs", "ms", "s"):
+                self.freq_time_unit_var.set("ms")
+    
+    def _rebuild_shape_params(self):
+        """Rebuild the shape parameter widgets for the current waveform type."""
+        for widget in self.shape_param_widgets:
+            widget.destroy()
+        self.shape_param_widgets.clear()
+        self.shape_param_vars.clear()
+        self._shape_param_unit_vars = []
+        
+        wf_type = self.type_var.get()
+        if wf_type == "frequency_comb":
+            return
+        
+        params = self.SHAPE_PARAMS.get(wf_type, [])
+        time_defaults = self._get_time_defaults(wf_type)
+        time_idx = 0
+        row = 0
+        
+        # For trapezoid: add "Specify Pulse Time" checkbox before the params
+        if wf_type == "trapezoid":
+            self._trap_override_var = tk.BooleanVar(value=self._trap_pulse_override)
+            chk = ttk.Checkbutton(self.shape_frame, text="Specify Pulse Time",
+                                  variable=self._trap_override_var,
+                                  command=self._on_trap_override_toggle)
+            chk.grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=3)
+            self.shape_param_widgets.append(chk)
+            row = 1
+        
+        for i, (label_text, ptype, default_val) in enumerate(params):
+            lbl = ttk.Label(self.shape_frame, text=f"{label_text}:")
+            lbl.grid(row=row + i, column=0, sticky="e", padx=5, pady=3)
+            
+            param_frame = ttk.Frame(self.shape_frame)
+            param_frame.grid(row=row + i, column=1, columnspan=2, sticky="w", padx=5, pady=3)
+            
+            if ptype == "time":
+                if default_val is None:
+                    val_s = time_defaults[time_idx] if time_idx < len(time_defaults) else 0
+                    disp, unit = self._best_time_unit(val_s)
+                    time_idx += 1
+                else:
+                    disp = float(default_val)
+                    unit = "s"
+                var = tk.StringVar(value=f"{disp:.6g}")
+                ent = ttk.Entry(param_frame, textvariable=var, width=12)
+                ent.pack(side="left")
+                unit_var = tk.StringVar(value=unit)
+                unit_cb = ttk.Combobox(param_frame, textvariable=unit_var,
+                                       state="readonly", width=4,
+                                       values=["µs", "ms", "s"])
+                unit_cb.pack(side="left", padx=(3, 0))
+                unit_cb.bind("<<ComboboxSelected>>", lambda e: self._update_info())
+                self._shape_param_unit_vars.append(unit_var)
+                self.shape_param_widgets.extend([lbl, param_frame])
+            else:
+                if default_val is None:
+                    default_val = "0"
+                var = tk.StringVar(value=default_val)
+                ent = ttk.Entry(param_frame, textvariable=var, width=12)
+                ent.pack(side="left")
+                self._shape_param_unit_vars.append(None)  # no unit
+                self.shape_param_widgets.extend([lbl, param_frame])
+            
+            ent.bind("<KeyRelease>", lambda e: self._update_info())
+            self.shape_param_vars.append(var)
+            
+            # Trapezoid: disable pulse time entry when not overridden
+            if wf_type == "trapezoid" and label_text == "Pulse Time":
+                self._trap_pulse_entry = ent
+                self._trap_pulse_idx = len(self.shape_param_vars) - 1
+                if not self._trap_pulse_override:
+                    ent.config(state="disabled")
+    
+    def _on_trap_override_toggle(self):
+        """Toggle trapezoid pulse time override."""
+        self._trap_pulse_override = self._trap_override_var.get()
+        if hasattr(self, '_trap_pulse_entry'):
+            if self._trap_pulse_override:
+                self._trap_pulse_entry.config(state="normal")
+            else:
+                self._trap_pulse_entry.config(state="disabled")
+                # Recompute auto pulse time
+                self._update_trap_auto_pulse()
+        self._update_info()
+    
+    def _update_trap_auto_pulse(self):
+        """Auto-compute trapezoid pulse time = shape_period - rise - fall."""
+        try:
+            freq = self._get_output_frequency()
+            period = 1.0 / freq
+            pol = self.polarity_var.get()
+            shape_period = period / 2 if pol == "bipolar" else period
+            
+            params_s = self._get_shape_params_seconds()
+            rise_s = params_s[0]
+            fall_s = params_s[2]
+            pulse_s = max(0, shape_period - rise_s - fall_s)
+            
+            disp, unit = self._best_time_unit(pulse_s)
+            self.shape_param_vars[self._trap_pulse_idx].set(f"{disp:.6g}")
+            self._shape_param_unit_vars[self._trap_pulse_idx].set(unit)
+        except (ValueError, ZeroDivisionError, IndexError):
+            pass
+    
+    def _get_time_defaults(self, wf_type):
+        """Compute default time-based parameter values from the current period (in seconds)."""
+        try:
+            freq = self._get_output_frequency()
+            period = 1.0 / freq
+        except (ValueError, ZeroDivisionError):
+            period = 1e-3
+        if self.polarity_var.get() == "bipolar":
+            period = period / 2
+        return {
+            "square":      [period / 2],
+            "ramp":        [period],
+            "trapezoid":   [period * 0.2, period * 0.6, period * 0.2],
+            "pulse":       [period * 0.1, period * 0.05, period * 0.05],
+            "exponential": [period * 0.2],
+            "gaussian":    [period * 0.3],
+        }.get(wf_type, [])
+    
+    def _get_shape_params(self):
+        """Get the current shape parameter values as raw display numbers."""
+        return [float(var.get()) for var in self.shape_param_vars]
+    
+    def _get_shape_params_seconds(self):
+        """Get all shape params converted to base units (seconds for time, raw for plain)."""
+        result = []
+        for var, unit_var in zip(self.shape_param_vars, self._shape_param_unit_vars):
+            val = float(var.get())
+            if unit_var is not None:
+                val *= self.TIME_UNITS[unit_var.get()]
+            result.append(val)
+        return result
+    
+    def _get_output_frequency(self):
+        """Derive the output frequency in Hz from the dialog's frequency/period controls."""
+        val = float(self.freq_time_var.get())
+        if val <= 0:
+            raise ValueError("Frequency/period must be positive")
+        if self.drive_mode_var.get() == "frequency":
+            return val * self.FREQ_UNITS[self.freq_time_unit_var.get()]
+        else:
+            period_s = val * self.TIME_UNITS[self.freq_time_unit_var.get()]
+            if self.polarity_var.get() == "unipolar":
+                return 1.0 / period_s
+            else:
+                return 1.0 / (2.0 * period_s)
     
     def _on_freq_mode_change(self):
         """Handle frequency input mode change."""
@@ -1264,15 +1653,29 @@ class ArbGeneratorDialog(tk.Toplevel):
                 )
                 self.warning_var.set(info.get('warning') or "")
             else:
-                freq = self.output_frequency
+                freq = self._get_output_frequency()
                 num_pts = compute_optimal_points(freq)
                 sr = freq * num_pts
                 info = check_frequency_feasibility(freq, num_pts)
-                self.info_var.set(
-                    f"Output frequency: {freq:.4g} Hz\n"
+                pol = self.polarity_var.get()
+                mode = self.drive_mode_var.get()
+                period = 1.0 / freq
+                shape_period = period / 2 if pol == "bipolar" else period
+                lines = [
+                    f"Polarity: {pol} | Mode: {mode}",
+                    f"Output frequency: {freq:.4g} Hz | Period: {period*1e3:.4g} ms",
+                ]
+                if pol == "bipolar":
+                    lines.append(f"Shape half-period: {shape_period*1e3:.4g} ms")
+                lines.append(
                     f"Optimal points: {num_pts} | "
                     f"Sample rate: {sr/1e3:.1f} kSa/s"
                 )
+                # Auto-update trapezoid pulse time when not overridden
+                if wf_type == "trapezoid" and not self._trap_pulse_override:
+                    self._update_trap_auto_pulse()
+                    
+                self.info_var.set("\n".join(lines))
                 self.warning_var.set(info.get('warning') or "")
         except (ValueError, ZeroDivisionError) as e:
             self.info_var.set(f"Cannot compute: {e}")
@@ -1282,35 +1685,84 @@ class ArbGeneratorDialog(tk.Toplevel):
         """Generate the waveform with auto-optimal points."""
         try:
             wf_type = self.type_var.get()
-            duty = float(self.duty_var.get())
             
             self.waveform_type = wf_type
             
             if wf_type == "frequency_comb":
                 self.result = self._generate_frequency_comb()
             else:
-                # Auto-calculate optimal points from output frequency
-                points = compute_optimal_points(self.output_frequency)
-                info = check_frequency_feasibility(self.output_frequency, points)
+                # Get output frequency from dialog controls
+                output_freq = self._get_output_frequency()
+                points = compute_optimal_points(output_freq)
+                info = check_frequency_feasibility(output_freq, points)
                 if info.get('warning'):
                     if not messagebox.askyesno("Warning", 
                             f"{info['warning']}\n\nContinue anyway?"):
                         return
                 
+                polarity = self.polarity_var.get()
+                params = self._get_shape_params_seconds()
+                
+                # For bipolar: generate unipolar shape at half the points
+                gen_points = points // 2 if polarity == "bipolar" else points
+                gen_points = max(gen_points, DG822_MIN_POINTS)
+                
+                # Convert time-based params to percentages for WaveformGenerator
+                period = 1.0 / output_freq
+                shape_period = period / 2 if polarity == "bipolar" else period
+                
                 if wf_type == "square":
-                    self.result = WaveformGenerator.square(points, duty)
+                    duty = params[0] / shape_period * 100
+                    result = WaveformGenerator.square(gen_points, duty)
                 elif wf_type == "sine":
-                    self.result = WaveformGenerator.sine(points)
+                    result = WaveformGenerator.sine(gen_points, params[0])
                 elif wf_type == "ramp":
-                    self.result = WaveformGenerator.ramp(points, duty)
+                    symmetry = params[0] / shape_period * 100
+                    result = WaveformGenerator.ramp(gen_points, symmetry)
+                elif wf_type == "trapezoid":
+                    rise_s = params[0]
+                    pulse_s = params[1]
+                    fall_s = params[2]
+                    total_s = rise_s + pulse_s + fall_s
+                    
+                    # If overriding pulse and sum exceeds period, warn and default
+                    if self._trap_pulse_override and total_s > shape_period * 1.001:
+                        auto_pulse = max(0, shape_period - rise_s - fall_s)
+                        if not messagebox.askyesno("Warning",
+                                f"Rise + Pulse + Fall = {total_s*1e3:.4g} ms "
+                                f"exceeds shape period = {shape_period*1e3:.4g} ms.\n\n"
+                                f"Default pulse time to {auto_pulse*1e3:.4g} ms?"):
+                            return
+                        pulse_s = auto_pulse
+                        total_s = rise_s + pulse_s + fall_s
+                    
+                    r_pct = rise_s / shape_period * 100
+                    p_pct = pulse_s / shape_period * 100
+                    f_pct = fall_s / shape_period * 100
+                    result = WaveformGenerator.trapezoid(gen_points, r_pct, p_pct, f_pct)
                 elif wf_type == "pulse":
-                    self.result = WaveformGenerator.pulse(points, duty)
+                    w_pct = params[0] / shape_period * 100
+                    r_pct = params[1] / shape_period * 100
+                    f_pct = params[2] / shape_period * 100
+                    result = WaveformGenerator.pulse(gen_points, w_pct, r_pct, f_pct)
                 elif wf_type == "sinc":
-                    self.result = WaveformGenerator.sinc(points)
+                    result = WaveformGenerator.sinc(gen_points, int(params[0]))
                 elif wf_type == "exponential":
-                    self.result = WaveformGenerator.exponential_decay(points)
+                    tau_pct = params[0] / shape_period * 100
+                    result = WaveformGenerator.exponential_decay(gen_points, tau_pct)
                 elif wf_type == "gaussian":
-                    self.result = WaveformGenerator.gaussian(points)
+                    sigma_pct = params[0] / shape_period * 100
+                    result = WaveformGenerator.gaussian(gen_points, sigma_pct)
+                else:
+                    messagebox.showerror("Error", f"Unknown waveform type: {wf_type}")
+                    return
+                
+                # Apply bipolar transform if needed
+                if polarity == "bipolar":
+                    result = WaveformGenerator.make_bipolar(result, total_points=points)
+                
+                self.result = result
+                self.dialog_output_frequency = output_freq
             
             if self.result is not None:
                 self.destroy()

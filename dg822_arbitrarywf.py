@@ -21,7 +21,7 @@ import struct
 # DG822 Hardware Constants
 # =============================================================================
 DG822_MIN_POINTS = 8
-DG822_MAX_POINTS = 16384
+DG822_MAX_POINTS = 8192        # firmware 00.02.x rejects single-packet DAC16 > 8192 pts
 DG822_MIN_SAMPLE_RATE = 2e3      # 2 kSa/s
 DG822_MAX_SAMPLE_RATE = 30e6     # 30 MSa/s
 # Minimum points per cycle of highest frequency for smooth waveform
@@ -35,13 +35,13 @@ def compute_optimal_points(frequency: float) -> int:
 
     output_frequency = sample_rate / num_points
     => sample_rate = frequency * num_points
-    => max num_points = DG822_MAX_SAMPLE_RATE / frequency  (capped at 16384)
+    => max num_points = DG822_MAX_SAMPLE_RATE / frequency  (capped at 8192)
 
     Args:
         frequency: Desired output frequency in Hz
 
     Returns:
-        Optimal number of points (8–16384)
+        Optimal number of points (8–8192)
     """
     if frequency <= 0:
         return DG822_MAX_POINTS
@@ -213,14 +213,14 @@ class ArbitraryWaveform:
     Represents an arbitrary waveform that can be uploaded to the DG822.
     
     The DG822 supports arbitrary waveforms with:
-    - 8-16384 points per waveform
+    - 8-8192 points per waveform
     - 14-bit vertical resolution (-8192 to +8191 DAC values)
     - Voltage range determined by amplitude/offset settings
     """
     
     # DG822 arbitrary waveform specifications
     MIN_POINTS = 8
-    MAX_POINTS = 16384
+    MAX_POINTS = 8192
     DAC_MIN = -8192
     DAC_MAX = 8191
     DAC_RANGE = 16384
@@ -326,28 +326,46 @@ class ArbitraryWaveform:
         new_x = np.linspace(0, 1, num_points)
         self.data = np.interp(new_x, old_x, self.data)
     
-    def save_csv(self, filename: str) -> None:
+    def save_csv(self, filename: str, amplitude_vpp: float = 10.0) -> None:
         """
-        Save waveform to CSV file.
+        Save waveform to Rigol-compatible CSV file.
+        
+        Uses the same format as the Rigol DG800 eval software so the
+        file can be loaded directly by the instrument or eval software.
         
         Args:
             filename: Output filename
+            amplitude_vpp: Peak-to-peak amplitude in volts (for header only)
         """
         if self.data is None:
             return
         
+        n = len(self.data)
+        head_len = 15  # Rigol standard header field count
+        
         with open(filename, 'w') as f:
-            f.write(f"# Arbitrary Waveform: {self.name}\n")
-            f.write(f"# Points: {len(self.data)}\n")
-            f.write(f"# Description: {self.description}\n")
-            f.write("# Format: normalized values (-1 to +1)\n")
+            # Rigol CSV header
+            f.write("RIGOL:CSV DATA FILE\n")
+            f.write("TYPE:Arb\n")
+            f.write(f"AMP:{amplitude_vpp:.0f}Vpp\n")
+            f.write(f"DATA Number:{n}\n")
+            f.write("MODE:Insert\n")
+            f.write("Sample Rate:0\n")
+            f.write(f"FileHead Length:{head_len}\n")
+            # Pad to FileHead Length lines (7 header lines + 8 blank = 15)
+            for _ in range(head_len - 7):
+                f.write("\n")
+            # Data values (float, -1 to +1)
             for val in self.data:
-                f.write(f"{val:.6f}\n")
+                f.write(f"{val:.8g}\n")
     
     @classmethod
     def from_csv(cls, filename: str) -> 'ArbitraryWaveform':
         """
         Create an ArbitraryWaveform from a CSV file.
+        
+        Supports both Rigol-format CSV (with header) and simple CSV
+        (comment lines starting with #, one value per line).
         
         Args:
             filename: Input filename
@@ -372,6 +390,9 @@ class ArbitraryWaveform:
         """
         Load waveform from CSV file into this instance.
         
+        Supports both Rigol-format CSV (RIGOL:CSV DATA FILE header)
+        and simple CSV (comment lines starting with #, one value per line).
+        
         Args:
             filename: Input filename
             
@@ -381,14 +402,46 @@ class ArbitraryWaveform:
         try:
             data = []
             with open(filename, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    try:
-                        data.append(float(line))
-                    except ValueError:
-                        continue
+                first_line = f.readline().strip()
+                f.seek(0)
+                
+                if first_line == "RIGOL:CSV DATA FILE":
+                    # Rigol format: skip header lines, then read float values
+                    head_len = 15  # default
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("FileHead Length:"):
+                            try:
+                                head_len = int(line.split(":")[1])
+                            except ValueError:
+                                pass
+                            break
+                    # Skip remaining header lines
+                    f.seek(0)
+                    for _ in range(head_len):
+                        f.readline()
+                    # Read data
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            data.append(float(line))
+                        except ValueError:
+                            continue
+                else:
+                    # Simple format: skip comments (#) and blank lines
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        # Also skip lines that look like Rigol headers
+                        if ':' in line and not line.replace('.','',1).replace('-','',1).replace('e','',1).replace('E','',1).lstrip().replace('+','',1).isdigit():
+                            continue
+                        try:
+                            data.append(float(line))
+                        except ValueError:
+                            continue
             
             if data:
                 self.data = np.array(data)
@@ -398,30 +451,40 @@ class ArbitraryWaveform:
             print(f"Error loading CSV: {e}")
             return False
     
-    def save_binary(self, filename: str) -> None:
+    def save_binary(self, filename: str, amplitude_vpp: float = 10.0) -> None:
         """
-        Save waveform to binary file (more compact).
+        Save waveform to Rigol RAF binary file.
+        
+        Uses the real Rigol RAF format compatible with DG800 eval software:
+          - 65-byte header: 'RIGOLArb' magic, amplitude, point count
+          - Data: float32 values in [-1, +1] range
         
         Args:
-            filename: Output filename
+            filename: Output filename (should end in .raf)
+            amplitude_vpp: Peak-to-peak amplitude in volts
         """
         if self.data is None:
             return
         
-        dac_values = self.get_dac_values()
+        n = len(self.data)
         
         with open(filename, 'wb') as f:
-            # Header
-            f.write(b'DG82ARB\x00')  # Magic number
-            f.write(struct.pack('<I', len(dac_values)))  # Number of points
-            f.write(self.name.ljust(12).encode('ascii')[:12])  # Name
-            # Data
-            for val in dac_values:
-                f.write(struct.pack('<h', val))
+            # 65-byte header
+            f.write(b'RIGOLArb')                            # bytes 0-7:  magic
+            f.write(struct.pack('<d', amplitude_vpp))        # bytes 8-15: double amplitude (Vpp)
+            f.write(struct.pack('<I', n))                    # bytes 16-19: uint32 num points
+            f.write(b'\x00' * 8)                             # bytes 20-27: reserved
+            f.write(b'\x00\x0F\x00\x00')                    # bytes 28-31: file head marker (15)
+            f.write(b'\x00' * 33)                            # bytes 32-64: padding to 65 bytes
+            # Data: float32 values
+            for val in self.data:
+                f.write(struct.pack('<f', float(val)))
     
     def load_binary(self, filename: str) -> bool:
         """
-        Load waveform from binary file.
+        Load waveform from a Rigol RAF binary file.
+        
+        Also supports the legacy DG82ARB format for backward compatibility.
         
         Args:
             filename: Input filename
@@ -432,20 +495,36 @@ class ArbitraryWaveform:
         try:
             with open(filename, 'rb') as f:
                 magic = f.read(8)
-                if magic != b'DG82ARB\x00':
+                
+                if magic == b'RIGOLArb':
+                    # Real Rigol RAF format
+                    amp = struct.unpack('<d', f.read(8))[0]   # amplitude
+                    n = struct.unpack('<I', f.read(4))[0]     # num points
+                    f.seek(65)                                 # skip to data
+                    raw = f.read(n * 4)
+                    if len(raw) != n * 4:
+                        print(f"Error: Expected {n*4} bytes, got {len(raw)}")
+                        return False
+                    self.data = np.array(struct.unpack(f'<{n}f', raw),
+                                         dtype=np.float64)
+                    self.data = np.clip(self.data, -1.0, 1.0)
+                    return True
+                    
+                elif magic == b'DG82ARB\x00':
+                    # Legacy custom format (backward compatibility)
+                    num_points = struct.unpack('<I', f.read(4))[0]
+                    self.name = f.read(12).decode('ascii').strip()
+                    dac_values = []
+                    for _ in range(num_points):
+                        val = struct.unpack('<h', f.read(2))[0]
+                        dac_values.append(val)
+                    self.data = np.array(dac_values) / self.DAC_MAX
+                    return True
+                    
+                else:
+                    print(f"Error: Unknown binary format (magic: {magic})")
                     return False
-                
-                num_points = struct.unpack('<I', f.read(4))[0]
-                self.name = f.read(12).decode('ascii').strip()
-                
-                dac_values = []
-                for _ in range(num_points):
-                    val = struct.unpack('<h', f.read(2))[0]
-                    dac_values.append(val)
-                
-                # Convert DAC values to normalized
-                self.data = np.array(dac_values) / self.DAC_MAX
-                return True
+                    
         except Exception as e:
             print(f"Error loading binary: {e}")
             return False
@@ -586,6 +665,75 @@ class WaveformGenerator:
         return wf
     
     @staticmethod
+    def trapezoid(num_points: int = 1024, rise_percent: float = 20.0,
+                  pulse_percent: float = 60.0, fall_percent: float = 20.0) -> ArbitraryWaveform:
+        """
+        Generate an acute trapezoid waveform.
+        
+        The waveform rises from -1 to +1, holds at +1, falls back to -1,
+        then holds at -1 for any remaining time (baseline dwell).
+        
+        Rise + Pulse + Fall can be ≤ 100%.  Any leftover fills with -1.
+        If they sum to > 100%, they are renormalized to 100%.
+        If rise_percent or fall_percent is 0, it is clamped to the minimum
+        (one sample), giving effectively vertical edges.
+        
+        Args:
+            num_points: Number of points
+            rise_percent: Rise time as percent of period
+            pulse_percent: Pulse (on) time as percent of period
+            fall_percent: Fall time as percent of period
+            
+        Returns:
+            ArbitraryWaveform object
+        """
+        wf = ArbitraryWaveform("TRAPZD")
+        
+        total = rise_percent + pulse_percent + fall_percent
+        if total <= 0:
+            total = 100
+        
+        # If sum > 100%, renormalize to exactly 100%
+        if total > 100:
+            scale = 100.0 / total
+            rise_percent *= scale
+            pulse_percent *= scale
+            fall_percent *= scale
+            total = 100.0
+        
+        rise_frac = rise_percent / 100.0
+        pulse_frac = pulse_percent / 100.0
+        fall_frac = fall_percent / 100.0
+        baseline_frac = 1.0 - rise_frac - pulse_frac - fall_frac
+        
+        rise_samples = max(1, int(round(num_points * rise_frac)))
+        pulse_samples = max(0, int(round(num_points * pulse_frac)))
+        fall_samples = max(1, int(round(num_points * fall_frac)))
+        baseline_samples = num_points - rise_samples - pulse_samples - fall_samples
+        if baseline_samples < 0:
+            # Trim pulse to fit
+            pulse_samples = max(0, pulse_samples + baseline_samples)
+            baseline_samples = 0
+        
+        rise = np.linspace(-1, 1, rise_samples, endpoint=False)
+        high = np.ones(pulse_samples)
+        fall = np.linspace(1, -1, fall_samples + 1)[1:]  # exclude duplicate +1
+        low = -np.ones(max(0, baseline_samples))
+        
+        data = np.concatenate([rise, high, fall, low])
+        
+        # Ensure exact length
+        if len(data) < num_points:
+            data = np.concatenate([data, -np.ones(num_points - len(data))])
+        elif len(data) > num_points:
+            data = data[:num_points]
+        
+        wf.set_data_normalized(data)
+        wf.description = (f"Trapezoid, {rise_percent:.1f}% rise, "
+                          f"{pulse_percent:.1f}% pulse, {fall_percent:.1f}% fall")
+        return wf
+    
+    @staticmethod
     def sinc(num_points: int = 1024, num_lobes: int = 5) -> ArbitraryWaveform:
         """
         Generate a sinc function.
@@ -702,6 +850,46 @@ class WaveformGenerator:
         
         wf.set_data_normalized(data)
         wf.description = "Custom function"
+        return wf
+    
+    @staticmethod
+    def make_bipolar(unipolar_wf: 'ArbitraryWaveform',
+                     total_points: int = None) -> 'ArbitraryWaveform':
+        """
+        Convert a unipolar waveform into a bipolar one (positive then negative).
+        
+        The input waveform is expected to be normalised to [-1, +1] where
+        -1 represents the baseline and +1 the peak.  The method rescales
+        each half to [0, +1] for the positive portion and [0, -1] for
+        the negative portion, then concatenates them.
+        
+        Args:
+            unipolar_wf: A unipolar ArbitraryWaveform with N points.
+            total_points: Desired total points for the bipolar result.
+                          If None, result has 2*N points.
+        
+        Returns:
+            A new ArbitraryWaveform with positive-then-negative shape.
+        """
+        data = unipolar_wf.data.copy()
+        
+        # Map from [-1, +1] (unipolar DAC range) to [0, +1] (pure positive shape)
+        positive = (data + 1.0) / 2.0
+        
+        # Negative mirror
+        negative = -positive
+        
+        bipolar_data = np.concatenate([positive, negative])
+        
+        # Resample to exact target if requested
+        if total_points is not None and len(bipolar_data) != total_points:
+            old_x = np.linspace(0, 1, len(bipolar_data))
+            new_x = np.linspace(0, 1, total_points)
+            bipolar_data = np.interp(new_x, old_x, bipolar_data)
+        
+        wf = ArbitraryWaveform(f"BI{unipolar_wf.name[:5]}")
+        wf.set_data_normalized(bipolar_data)
+        wf.description = f"Bipolar {unipolar_wf.description}"
         return wf
     
     @staticmethod
