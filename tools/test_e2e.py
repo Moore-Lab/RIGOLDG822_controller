@@ -1,10 +1,12 @@
 """End-to-end test: simulate the GUI upload flow through the real modules."""
 import sys
-sys.path.insert(0, r'c:\Users\darro\OneDrive - Yale University\Desktop\RIGOLDG822_controller')
+import os
+# Run from anywhere: the rigol_dg822 package lives one level up from tools/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import time
-from dg822_controller import DG822Controller
-from dg822_arbitrarywf import WaveformGenerator, compute_optimal_points
+from rigol_dg822.controller import DG822Controller
+from rigol_dg822.arbitrary import WaveformGenerator, compute_optimal_points
 
 VISA = "USB0::0x1AB1::0x0643::DG8A252001971::0::INSTR"
 CH = 1

@@ -281,7 +281,13 @@ class DG822Output:
         """
         response = self._conn.query(f":OUTPut{channel}:SYNC?")
         if response:
-            return response == "1"
+            # The DG800 programming guide is explicit for this query: "The query
+            # returns ON or OFF", and its own example shows :OUTP1:SYNC?
+            # returning ON. Matching only "1" made this return False for every
+            # enabled sync signal on real hardware -- the page would show sync
+            # off while the rear-panel connector was driving. Accept both forms,
+            # exactly as get_state() above does for :OUTPut:STATe?.
+            return response == "1" or response.strip().upper() == "ON"
         return None
     
     def set_sync_mode(self, channel: int, mode: SyncMode) -> bool:
@@ -413,7 +419,7 @@ class DG822Output:
 # Module Test / Evaluation Mode
 # =============================================================================
 if __name__ == "__main__":
-    from dg822_connection import DG822Connection
+    from .connection import DG822Connection
     
     # Known working resource (update this if your device has a different ID)
     KNOWN_RESOURCE = 'USB0::0x1AB1::0x0643::DG8A204201757::0::INSTR'

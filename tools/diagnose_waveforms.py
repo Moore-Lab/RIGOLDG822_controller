@@ -4,8 +4,10 @@ Dumps the actual data arrays and DAC values to find discrepancies.
 """
 import numpy as np
 import sys
-sys.path.insert(0, r'c:\Users\darro\OneDrive - Yale University\Desktop\RIGOLDG822_controller')
-from dg822_arbitrarywf import WaveformGenerator, compute_optimal_points
+import os
+# Run from anywhere: the rigol_dg822 package lives one level up from tools/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from rigol_dg822.arbitrary import WaveformGenerator, compute_optimal_points
 
 # ── Trapezoid (unipolar) ──
 print("="*60)
@@ -102,7 +104,7 @@ print("\n" + "="*60)
 print("FREQUENCY COMB ANALYSIS")
 print("="*60)
 freqs = [100, 200, 300, 400, 500]
-from dg822_arbitrarywf import compute_optimal_points_for_comb
+from rigol_dg822.arbitrary import compute_optimal_points_for_comb
 num_pts, info = compute_optimal_points_for_comb(freqs)
 print(f"Frequencies: {freqs}")
 print(f"Fundamental: {info['fundamental']} Hz")

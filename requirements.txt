@@ -1,19 +1,40 @@
-# RIGOL DG822 Controller - Dependencies
-# Install with: pip install -r requirements.txt
+# xsphere-rigol-dg822 dependencies. Install with: pip install -r requirements.txt
+#
+# The simulated instrument (rigol_dg822.sim) is stdlib only, so the driver, the
+# CLI and the web page all run with none of this installed except what their own
+# front end needs. Talking to a real DG822 is the part with requirements.
 
-# PyVISA - VISA communication library
-pyvisa>=1.13.0
+# Waveform maths (arbitrary synthesis + preview)
+numpy                  # arbitrary.py: comb synthesis, +-1 <-> 14-bit DAC16 packing; plot.py arrays
+scipy                  # plot.py only: signal.square / signal.sawtooth in the square + ramp previews
 
-# PyVISA-py backend (pure Python, no NI-VISA needed for basic USB)
-# Or use NI-VISA for full hardware support
-pyvisa-py>=0.7.0
+# Web control page (rigol_dg822.webapp)
+fastapi
+uvicorn
 
-# Optional: For USB device support without NI-VISA
-pyusb>=1.2.0
+# Desktop GUI (dg822_gui.py)
+matplotlib             # embedded live preview; plot.create_figure() also uses it headless (Agg)
+# tkinter is not on PyPI -- it ships with python.org Windows builds and Anaconda.
+# If "import tkinter" fails, install the interpreter's Tk, don't pip anything.
 
-# Optional: For future GUI development
-# tkinter is included with Python on Windows
-# For more advanced GUI:
-# PyQt6>=6.5.0
-# or
-# customtkinter>=5.2.0
+# VISA transport -- REQUIRED FOR REAL HARDWARE ONLY
+#
+# pyvisa is the API, not the driver. It needs a VISA *implementation* underneath,
+# and this DAQ machine has none: pyvisa imports fine, then
+# pyvisa.ResourceManager() raises "Could not locate a VISA implementation".
+# So the line below is necessary and not sufficient -- pick one of the two
+# backends after it. connection.py guards the import and degrades to a marked
+# "unavailable" state either way, so an incomplete VISA stack costs you the
+# instrument, never the panel.
+pyvisa
+#
+#   Backend A (recommended on Windows): the NI-VISA runtime. Not a pip package --
+#   download it from ni.com/visa. It also supplies the USB-TMC driver, which is
+#   why a DG822 plugged into a Windows box with NI-VISA installed just appears.
+#
+#   Backend B (pure Python, no vendor runtime):
+#       pip install pyvisa-py pyusb
+#   pyusb additionally needs a libusb backend and, on Windows, the DG822's USB
+#   interface bound to WinUSB/libusb (Zadig) rather than to the vendor driver.
+#
+# Neither backend is needed for rigol_dg822.sim, and neither is installed here.

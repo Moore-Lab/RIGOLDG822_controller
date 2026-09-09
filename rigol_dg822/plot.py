@@ -1,20 +1,27 @@
 """
 RIGOL DG822 Waveform Generator - Plot Module
 
-This module provides waveform visualization for the DG822 controller.
-It can generate preview plots of waveforms based on parameters or
-display arbitrary waveform data.
+Waveform preview for the DG822 controller: the pure ``generate_*`` helpers turn
+instrument settings into (time, voltage) arrays, and WaveformPlotter draws them
+into a matplotlib figure.
+
+This module must import on a headless server, so the GUI is kept out of the
+import path. tkinter, FigureCanvasTkAgg and pyplot are imported inside the
+functions that actually need a display; matplotlib itself is imported inside
+create_figure with a non-interactive backend forced first. The ``generate_*``
+helpers therefore work with matplotlib absent entirely -- the web/CLI layers
+import this module for the maths and never touch a canvas.
 
 Author: Auto-generated
 Date: 2026-01-09
 """
 
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from __future__ import annotations
+
+import sys
 from typing import Optional, Tuple, List, Union
-import tkinter as tk
+
+import numpy as np
 
 
 class WaveformPlotter:
@@ -287,6 +294,16 @@ class WaveformPlotter:
         Returns:
             Matplotlib Figure object
         """
+        import matplotlib
+
+        # Figure() is backend-agnostic, but matplotlib resolves a default
+        # backend the first time anything asks for one -- TkAgg on this Windows
+        # box, which needs a display. Pin Agg before that happens, unless pyplot
+        # is already up (the tkinter GUI's own doing; leave its choice alone).
+        if "matplotlib.pyplot" not in sys.modules:
+            matplotlib.use("Agg", force=True)
+        from matplotlib.figure import Figure
+
         self.fig = Figure(figsize=figsize, dpi=dpi)
         self.ax = self.fig.add_subplot(111)
         return self.fig
@@ -440,6 +457,10 @@ class WaveformPlotter:
         Returns:
             FigureCanvasTkAgg object
         """
+        # Deferred: importing backend_tkagg pulls in tkinter unconditionally,
+        # which is an ImportError on a headless server. Only the GUI gets here.
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
         if self.fig is None:
             self.create_figure()
         
@@ -483,6 +504,8 @@ def plot_waveform_standalone(waveform_type: str, frequency: float = 1000.0,
         channel: Channel number
         arb_data: Arbitrary waveform data
     """
+    import matplotlib.pyplot as plt
+
     plotter = WaveformPlotter()
     plotter.create_figure(figsize=(10, 5))
     plotter.plot_waveform(
@@ -496,6 +519,8 @@ def plot_waveform_standalone(waveform_type: str, frequency: float = 1000.0,
 # Module Test / Evaluation Mode
 # =============================================================================
 if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+
     print("=" * 60)
     print("DG822 Plot Module - Evaluation Mode")
     print("=" * 60)

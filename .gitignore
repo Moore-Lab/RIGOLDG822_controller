@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Generated waveforms (rig state, not source).
+# waveforms/ is where the GUI's "save" writes and where the arb generator drops
+# its output -- the CSVs here are 80-170 KB numeric dumps regenerated from a
+# handful of parameters (frequency list, point count, phase seed), and half of
+# them are scratch from a bench session (TEST_GUI, TEST_RAF). A .RAF is one step
+# further downstream: the 14-bit DAC16 image of a CSV, in the instrument's own
+# internal-memory format. Neither is anybody's source of truth, so both are
+# treated the way the dock treats recordings/ -- keep the folder, ignore what
+# lands in it. Anything that is genuinely a worked example belongs in README.md
+# as the parameters that produce it, not as a megabyte of samples.
+waveforms/*
+!waveforms/.gitkeep
+!waveforms/README.md
+*.raf
+*.RAF
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code local tooling (matches xsphere-camera-dock/.gitignore).
+# .claude/launch.json holds machine-specific interpreter paths.
+.claude/

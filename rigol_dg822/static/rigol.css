@@ -1,0 +1,204 @@
+/* xsphere-daq — Rigol DG822 subsystem page.
+
+   Same visual language as the camera dock
+   (xsphere-camera-dock/camera_dock/static/dock.css) and the panel shell
+   (xsphere_daq/static/shell.css). The declarations are duplicated here rather
+   than cross-linked to /cameras/static/dock.css so this app stays
+   standalone-runnable and independent of the dock's mount path — the shell's
+   own stylesheet sets the same precedent. No @import, no web fonts, no
+   images: the panel has to work on a rig with no internet. */
+
+body { margin:0; background:#111; color:#ddd; font-family:system-ui,sans-serif;
+       font-size:14px; }
+/* Sticky, not static. The SIMULATED badge, the connection state and the
+   OUTPUT ON pill all live in here, and the page is roughly twice the height of
+   its pane once both channel cards, the arbitrary block and the presets are
+   laid out. Static positioning meant that for most of the page's scroll range
+   -- the arbitrary block, the presets, CH2 -- nothing on screen distinguished
+   the simulator from a DG822 physically driving the experiment, in either
+   direction. A solid background is required, not decorative: content scrolls
+   underneath. */
+header { padding:8px 14px; background:#000; display:flex; align-items:center;
+         gap:10px; flex-wrap:wrap;
+         position:sticky; top:0; z-index:20; }
+header b { font-size:16px; }
+header .sub { color:#888; font-size:12px; }
+
+/* Mounted inside the DAQ panel (see the guard in index.html): the shell's rail
+   owns navigation and names the subsystem, so drop this page's own title.
+   Everything else stays — the connection state and the SIMULATED badge are
+   live state the rail does not duplicate. No effect standalone. */
+.embedded header { padding:5px 14px; background:#0a0a0a; }
+.embedded header b#title { display:none; }
+
+a { color:#8cf; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.status { color:#7cf; font-size:12px; margin-left:auto; text-align:right; }
+.status.ok  { color:#7f7; }
+.status.err { color:#c77; }
+
+button { background:#264; color:#dfd; border:1px solid #486; border-radius:4px;
+         padding:6px 10px; cursor:pointer; font-size:13px; }
+button:hover { background:#386; }
+button:disabled { opacity:.45; cursor:default; }
+button.ghost { background:#222; color:#bbb; border-color:#444; }
+button.ghost:hover { background:#333; }
+button.warn { background:#622; color:#fdd; border-color:#a55; }
+button.warn:hover { background:#833; }
+/* The output button while the output is live: same role as the dock's
+   button.rec.on — the loudest control on the card. */
+button.warn.on { background:#a33; }
+button.tiny { padding:2px 7px; font-size:11px; }
+:focus-visible { outline:2px solid #4a8; outline-offset:1px; }
+
+input[type=text], input[type=number], select, textarea {
+  background:#222; color:#ddd; border:1px solid #444; border-radius:3px;
+  padding:3px 5px; font-size:13px; font-family:inherit; }
+input:disabled, select:disabled, textarea:disabled { opacity:.45; }
+input[type=checkbox], input[type=radio] { accent-color:#4a8; }
+input.num  { width:84px; }
+input.num.s { width:58px; }
+input.wide { flex:1 1 220px; min-width:140px; }
+select.wide { flex:1 1 200px; min-width:120px; }
+textarea { width:100%; box-sizing:border-box; resize:vertical; }
+
+/* ------------------------------------------------------- SIMULATED badge -- */
+/* Nobody may mistake a simulated run for hardware, so the badge is loud, sits
+   in the header (visible from every scroll position) and repaints the header
+   itself. */
+.simbadge { display:inline-flex; align-items:center; gap:6px; background:#33260f;
+            border:1px solid #a75; border-radius:12px; padding:2px 10px;
+            color:#fda; font-size:11px; font-weight:600; letter-spacing:.09em;
+            text-transform:uppercase; }
+/* MUST come after the rule above. `display:inline-flex` and the UA's
+   `[hidden] {display:none}` have equal specificity, and author styles win — so
+   setting el.hidden alone would leave a SIMULATED badge on screen while the
+   page is driving real hardware, which is the one lie this page must not tell.
+   (Same trap the shell hit with .recpill.) */
+.simbadge[hidden] { display:none; }
+.simbadge::before { content:"\26A0"; font-size:12px; }
+body.sim header { background:#2a1f08; box-shadow:inset 0 -2px 0 #a75; }
+/* A second, independent guarantee that a simulated instrument cannot be taken
+   for a real one. The sticky header above can still be defeated -- a short
+   viewport, a zoom level, a future layout change -- and mistaking simulation
+   for hardware is the single worst failure this page has. This frame is
+   position:fixed, so it is bound to the viewport rather than the document and
+   has no scroll range to fall out of. pointer-events:none so it never eats a
+   click; it is a marker, not a layer. */
+body.sim::after {
+  content:""; position:fixed; inset:0; pointer-events:none; z-index:9999;
+  border:2px solid #a75;
+}
+@media (prefers-reduced-motion: no-preference) {
+  body.sim::after { animation:simpulse 4s ease-in-out infinite; }
+}
+@keyframes simpulse { 0%,100% { border-color:#a75; } 50% { border-color:#6a4a10; } }
+
+/* --------------------------------------------------- output-ON indicator -- */
+.recpill { display:inline-flex; align-items:center; gap:8px; background:#3a1414;
+           border:1px solid #a33; border-radius:12px; padding:2px 8px 2px 10px;
+           color:#fdd; font-size:11px; letter-spacing:.06em; }
+/* Same [hidden] trap as .simbadge — a stale "OUTPUT ON" pill is a safety lie. */
+.recpill[hidden] { display:none; }
+.recpill .reclabel::before {
+  content:"\25CF"; color:#f55; margin-right:6px; animation:recblink 1.6s infinite; }
+@keyframes recblink { 0%,45% { opacity:1 } 60%,100% { opacity:.25 } }
+@media (prefers-reduced-motion: reduce) {
+  .recpill .reclabel::before { animation:none; }
+}
+
+/* ------------------------------------------------------------- structure -- */
+.wrap { padding:12px 14px 28px; }
+h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:#9ab;
+     border-bottom:1px solid #2a2a2a; padding-bottom:5px; margin:16px 0 12px; }
+h2:first-child { margin-top:4px; }
+
+.grid { display:flex; flex-wrap:wrap; gap:14px; align-items:flex-start; }
+.card { background:#1a1a1a; border:1px solid #333; border-radius:6px; padding:10px; }
+.card h3 { margin:0 0 8px; font-size:14px; color:#dde; display:flex;
+           align-items:center; gap:8px; flex-wrap:wrap; }
+.card.chan { flex:1 1 380px; min-width:300px; max-width:560px; }
+.card.wideblock { max-width:min(1100px, 100%); }
+
+.row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:7px 0; }
+.row > label, .row .lbl { color:#aaa; }
+.row > label.fixed, .row .lbl.fixed { min-width:82px; }
+.row .unit { color:#aaa; font-size:12px; }
+.row .val { color:#7cf; }
+.chk { display:inline-flex; align-items:center; gap:5px; color:#aaa; }
+.spacer { flex:1 1 auto; }
+.bar { display:flex; align-items:center; gap:6px; padding-top:8px; flex-wrap:wrap; }
+
+.hint { color:#777; font-size:12px; }
+.small { color:#888; font-size:12px; }
+.muted { color:#666; }
+.statusline { color:#8a8; font-size:12px; padding-top:5px; min-height:1.15em;
+              word-break:break-word; }
+.statusline.err { color:#c77; }
+#stat { color:#fc7; margin-top:12px; min-height:1.2em; word-break:break-all; }
+
+/* Per-item detail, monospaced so numbers line up between polls
+   (shell.css .acqdetail). */
+.detail { display:flex; flex-direction:column; gap:2px; padding-top:4px;
+          color:#8a8; font-size:12px;
+          font-family:ui-monospace,Consolas,monospace; word-break:break-word; }
+.detail .warn { color:#fb3; }
+.detail .err  { color:#c77; }
+
+/* Feasibility warnings are the whole point of the arb sizing maths, so they get
+   a block of their own rather than a line that scrolls past. */
+.warnbox { background:#2a2109; border:1px solid #a75; border-radius:4px;
+           color:#fda; font-size:12px; padding:6px 8px; margin:8px 0 0;
+           white-space:pre-wrap; word-break:break-word;
+           font-family:ui-monospace,Consolas,monospace; }
+.warnbox[hidden] { display:none; }
+/* Limit warnings outrank preview warnings: a preview note is advisory, this one
+   says the instrument is not emitting what the card claims it is. */
+.warnbox.limitwarn { background:#3a1409; border-color:#c66; color:#fcc; }
+
+/* Entry-status vocabulary, identical to the rail's dots (shell.css). */
+.dot { width:8px; height:8px; border-radius:50%; background:#4a8; flex:0 0 auto;
+       display:inline-block; }
+.dot.off  { background:#5a5a5a; }
+.dot.err  { background:#c55; }
+.dot.warn { background:#fb3; }
+.dot.rec  { background:#f55; animation:recblink 1.6s infinite; }
+@media (prefers-reduced-motion: reduce) { .dot.rec { animation:none; } }
+
+/* A live output is the state that can damage something downstream, so the whole
+   card is marked, not just the button (dock idiom: .card.recording). */
+.card.chan.on { border-color:#a33; box-shadow:0 0 0 1px #a33 inset; }
+.card.chan.on h3 { color:#fdd; }
+
+/* ---------------------------------------------------------- preview plot -- */
+.preview { display:block; width:100%; height:172px; background:#0e0e0e;
+           border:1px solid #333; border-radius:4px; }
+.preview.tall { height:200px; }
+
+/* ------------------------------------------------------------ disconnected */
+/* Not connected is a state to explain, not a blank page: the note replaces the
+   cards' action bars and names the actual reason from /api/state. */
+.notice { color:#c77; font-size:12px; padding:6px 0 2px; word-break:break-word; }
+.notice[hidden] { display:none; }
+
+/* Lost contact with the service. Everything on screen is last-known, so stop
+   anything that animates — motion is what reads as "live" — without clearing
+   the values (shell.css body.stale). */
+body.stale .recpill { filter:saturate(.45); }
+body.stale .recpill .reclabel::before, body.stale .dot.rec { animation:none; }
+body.stale .dot { filter:saturate(.35); }
+body.stale .preview { opacity:.6; }
+
+#toast { position:fixed; bottom:16px; left:50%; transform:translateX(-50%);
+         background:#432; color:#fda; border:1px solid #a75; border-radius:6px;
+         padding:8px 14px; display:none; z-index:10; max-width:80vw;
+         text-align:center; word-break:break-word; }
+
+/* Side-by-side pane: the panel gives this page roughly half a screen, so the
+   channel cards stack and the fixed label column collapses rather than
+   pushing a horizontal scrollbar into the iframe. */
+@media (max-width: 780px) {
+  .card.chan { flex-basis:100%; max-width:none; min-width:0; }
+  .row > label.fixed, .row .lbl.fixed { min-width:0; }
+  .wrap { padding:10px 10px 24px; }
+}

@@ -5,14 +5,35 @@ This module handles VISA communication with the RIGOL DG822/DG800 Pro series
 waveform generators. It provides device discovery, connection management,
 and low-level SCPI command communication.
 
+Two backends sit behind one interface. The real one is pyvisa; the other is
+:mod:`rigol_dg822.sim`, selected by the resource name ``SIM::DG822::INSTR`` or
+by ``simulate=True``, which bypasses pyvisa entirely so the CLI, the web page
+and the tests run on a machine with no VISA implementation installed.
+
+Nothing here raises. A missing pyvisa, a missing VISA implementation, an absent
+instrument or a SCPI timeout all degrade to an empty device list or a False
+return with a printed reason -- a driver that tracebacks would take the whole
+panel down with it.
+
 Author: Auto-generated
 Date: 2026-01-08
 """
 
-import pyvisa
 from typing import Optional, List, Tuple
 import threading
 import time
+
+from .sim import SIM_RESOURCE, SIM_IDN, SimulatedResourceManager
+
+try:
+    import pyvisa
+except Exception as _exc:  # pragma: no cover - depends on the host
+    # Not an error on this box: the DAQ server has no VISA implementation and
+    # runs the sim. Only the hardware paths need pyvisa, and they say so.
+    pyvisa = None
+    _PYVISA_ERROR = f"pyvisa is not importable: {_exc}"
+else:
+    _PYVISA_ERROR = None
 
 
 class DG822Connection:
@@ -29,22 +50,32 @@ class DG822Connection:
     # RIGOL manufacturer ID string for identification
     RIGOL_ID = "Rigol"
     DG800_MODELS = ["DG821", "DG822", "DG852", "DG902", "DG912", "DG922"]
+
+    # Connecting to this resource name routes to rigol_dg822.sim, never pyvisa.
+    SIM_RESOURCE = SIM_RESOURCE
     
-    def __init__(self, resource_name: Optional[str] = None, timeout: int = 5000):
+    def __init__(self, resource_name: Optional[str] = None, timeout: int = 5000,
+                 simulate: bool = False):
         """
         Initialize the connection object.
         
         Args:
             resource_name: VISA resource string (e.g., 'USB0::0x1AB1::0x0643::DG8...::INSTR')
                           If None, use discover_devices() and connect() later.
+                          'SIM::DG822::INSTR' selects the simulated instrument.
             timeout: Communication timeout in milliseconds (default: 5000ms)
+            simulate: Force the simulated backend regardless of resource name
         """
-        self._rm: Optional[pyvisa.ResourceManager] = None
-        self._instrument: Optional[pyvisa.resources.Resource] = None
+        self._rm = None
+        self._instrument = None
         self._resource_name: Optional[str] = resource_name
         self._timeout = timeout
         self._connected = False
         self._idn_string: Optional[str] = None
+        self._simulate = bool(simulate) or resource_name == SIM_RESOURCE
+        # Why the last backend attempt failed, so callers can say so instead of
+        # reporting a bare "no devices found".
+        self._backend_error: Optional[str] = None
         
     @property
     def is_connected(self) -> bool:
@@ -61,6 +92,16 @@ class DG822Connection:
         """Return the current VISA resource name."""
         return self._resource_name
     
+    @property
+    def is_simulated(self) -> bool:
+        """Return True if this connection is talking to the simulated instrument."""
+        return self._simulate
+    
+    @property
+    def backend_error(self) -> Optional[str]:
+        """Why the VISA backend is unavailable, or None if it came up."""
+        return self._backend_error
+    
     def _init_resource_manager(self, backend: str = '') -> None:
         """
         Initialize the VISA resource manager if not already initialized.
@@ -71,20 +112,47 @@ class DG822Connection:
                      '@py' = force pyvisa-py backend
                      '@ni' = force NI-VISA backend
         """
-        if self._rm is None:
-            try:
-                self._rm = pyvisa.ResourceManager(backend)
-                print(f"Using VISA backend: {self._rm.visalib}")
-            except Exception as e:
-                print(f"Error initializing ResourceManager with '{backend}': {e}")
-                # Try fallback to pyvisa-py
-                if backend != '@py':
-                    try:
-                        self._rm = pyvisa.ResourceManager('@py')
-                        print(f"Fallback to pyvisa-py backend: {self._rm.visalib}")
-                    except Exception as e2:
-                        print(f"Fallback also failed: {e2}")
-                        raise
+        if self._rm is not None:
+            return
+
+        # Simulator injection point. list_resources(), discover_devices() and
+        # connect() all funnel through here and then touch only self._rm, so this
+        # single branch covers every path in the driver and leaves the real one
+        # below untouched. It must come before any pyvisa use: on this machine
+        # pyvisa may not even be importable.
+        if self._simulate:
+            self._rm = SimulatedResourceManager()
+            self._backend_error = None
+            print(f"Using VISA backend: {self._rm.visalib}")
+            return
+
+        if pyvisa is None:
+            self._backend_error = _PYVISA_ERROR
+            print(f"VISA unavailable: {self._backend_error}")
+            return
+
+        try:
+            self._rm = pyvisa.ResourceManager(backend)
+            self._backend_error = None
+            print(f"Using VISA backend: {self._rm.visalib}")
+        except Exception as e:
+            print(f"Error initializing ResourceManager with '{backend}': {e}")
+            # Try fallback to pyvisa-py
+            if backend != '@py':
+                try:
+                    self._rm = pyvisa.ResourceManager('@py')
+                    self._backend_error = None
+                    print(f"Fallback to pyvisa-py backend: {self._rm.visalib}")
+                    return
+                except Exception as e2:
+                    print(f"Fallback also failed: {e2}")
+                    e = e2
+            # Never-raise. This used to re-raise, so a box with no VISA
+            # implementation got a ValueError out of discover_devices() and took
+            # the panel down with it. Now the object stays usable and simply
+            # finds no hardware; backend_error carries the reason.
+            self._rm = None
+            self._backend_error = f"no VISA implementation ({e})"
     
     def list_resources(self, query: str = '?*::INSTR') -> List[str]:
         """
@@ -100,6 +168,9 @@ class DG822Connection:
             List of resource strings
         """
         self._init_resource_manager()
+        if self._rm is None:
+            print(f"No VISA resources: {self._backend_error}")
+            return []
         try:
             resources = list(self._rm.list_resources(query))
             print(f"Found {len(resources)} VISA resource(s): {resources}")
@@ -122,6 +193,14 @@ class DG822Connection:
         self._init_resource_manager()
         devices = []
         
+        # The sim is always offered, plainly marked, and listed last so real
+        # hardware still wins auto_connect().
+        sim_device = (SIM_RESOURCE, SIM_IDN)
+        
+        if self._rm is None:
+            print(f"No devices found: {self._backend_error}")
+            return [sim_device]
+        
         try:
             resources = self._rm.list_resources(query)
             # Filter out serial ports (ASRL) which can cause hangs
@@ -129,7 +208,7 @@ class DG822Connection:
             print(f"Scanning {len(resources)} USB resource(s)...")
         except Exception as e:
             print(f"Error listing resources: {e}")
-            return devices
+            return [sim_device]
         
         for resource in resources:
             print(f"  Trying: {resource}...", end=" ")
@@ -195,7 +274,8 @@ class DG822Connection:
                             break
             else:
                 devices.append((resource, idn))
-                
+        
+        devices.append(sim_device)
         return devices
     
     def connect(self, resource_name: Optional[str] = None) -> bool:
@@ -210,12 +290,25 @@ class DG822Connection:
         """
         if resource_name:
             self._resource_name = resource_name
+        
+        # Asking for the sim by name switches the backend even on a connection
+        # object that was built for hardware, and vice versa. A cached resource
+        # manager belongs to the backend that made it, so it goes with the switch.
+        if self._resource_name is not None:
+            wants_sim = (self._resource_name == SIM_RESOURCE)
+            if wants_sim != self._simulate:
+                self._simulate = wants_sim
+                self._rm = None
             
         if not self._resource_name:
             print("Error: No resource name specified")
             return False
         
         self._init_resource_manager()
+        if self._rm is None:
+            print(f"Connection error: {self._backend_error}")
+            print(f"Hint: connect to {SIM_RESOURCE} to run against the simulator.")
+            return False
         
         try:
             self._instrument = self._rm.open_resource(self._resource_name)
@@ -431,12 +524,16 @@ if __name__ == "__main__":
     
     # Step 1: Show available backends
     print("\n--- VISA Backend Information ---")
-    try:
-        rm_default = pyvisa.ResourceManager()
-        print(f"Default backend: {rm_default.visalib}")
-        rm_default.close()
-    except Exception as e:
-        print(f"Default backend failed: {e}")
+    if pyvisa is None:
+        print(f"Default backend unavailable: {_PYVISA_ERROR}")
+        print(f"Run against the simulator with: conn.connect('{SIM_RESOURCE}')")
+    else:
+        try:
+            rm_default = pyvisa.ResourceManager()
+            print(f"Default backend: {rm_default.visalib}")
+            rm_default.close()
+        except Exception as e:
+            print(f"Default backend failed: {e}")
     
     # Step 2: List raw resources (no query)
     print("\n--- Listing VISA Resources ---")

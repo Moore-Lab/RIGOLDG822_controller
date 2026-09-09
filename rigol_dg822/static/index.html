@@ -1,0 +1,185 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rigol DG822</title>
+<link rel="stylesheet" href="static/rigol.css">
+<!-- Empty data: icon, not a file: it stops the browser asking a standalone run
+     for a /favicon.ico this app does not serve. Framed by the panel, the
+     panel's own icon is what shows. Nothing on this page is fetched from
+     another host — the rig runs offline. -->
+<link rel="icon" href="data:,">
+<script>
+// Framed by the DAQ panel? Then the panel's rail owns navigation and identity,
+// and this page's title would repeat the rail entry. Hide only that — the
+// connection strip and the SIMULATED badge carry live state the rail does not
+// duplicate. Standalone (window.parent === window) is completely unaffected.
+if (window.parent !== window) document.documentElement.classList.add("embedded");
+</script>
+</head>
+<body>
+<header>
+  <b id="title">Rigol DG822</b>
+  <span class="simbadge" id="simbadge" hidden>simulated &mdash; not hardware</span>
+  <span class="status" id="info">connecting&hellip;</span>
+</header>
+
+<div class="wrap">
+
+  <h2>Connection</h2>
+  <div class="card wideblock" id="conncard">
+    <div class="row">
+      <label class="fixed" for="devsel">Device</label>
+      <select id="devsel" class="wide"><option value="">(scan to list instruments)</option></select>
+      <button id="scan" class="ghost">scan</button>
+    </div>
+    <div class="row">
+      <label class="fixed" for="visa">VISA address</label>
+      <input type="text" id="visa" class="wide" autocomplete="off" spellcheck="false"
+             placeholder="USB0::0x1AB1::0x0643::DG8A204201757::0::INSTR">
+    </div>
+    <div class="row">
+      <button id="connect">connect</button>
+      <button id="disconnect" class="ghost">disconnect</button>
+      <label class="chk"><input type="checkbox" id="simchk">
+        connect the simulated instrument instead</label>
+      <span class="spacer"></span>
+      <button id="beep" class="ghost" title="make the instrument beep, to confirm which box you are talking to">beep</button>
+      <button id="syncph" class="ghost" title="align CH1 and CH2 phase references">sync phases</button>
+      <button id="reset" class="warn" title="*RST — returns the instrument to its power-on state">reset</button>
+    </div>
+    <div class="statusline" id="conn-stat"></div>
+    <div class="detail" id="conn-detail"></div>
+  </div>
+
+  <h2>Channels</h2>
+  <div class="grid" id="channels"></div>
+
+  <h2>Arbitrary waveform</h2>
+  <div class="card wideblock" id="arbcard">
+    <div class="row">
+      <label class="fixed" for="arb-shape">Shape</label>
+      <select id="arb-shape" class="wide"></select>
+      <label for="arb-points">points</label>
+      <input type="text" id="arb-points" class="num s" placeholder="auto" autocomplete="off">
+      <span class="hint">blank = the largest count the sample rate allows</span>
+    </div>
+
+    <div class="row" id="arb-waverow" role="group" aria-label="wave properties">
+      <span class="lbl fixed">Polarity</span>
+      <label class="chk"><input type="radio" name="arb-pol" value="unipolar" checked> unipolar</label>
+      <label class="chk"><input type="radio" name="arb-pol" value="bipolar"> bipolar</label>
+      <span class="spacer"></span>
+      <span class="lbl">Drive</span>
+      <label class="chk"><input type="radio" name="arb-drive" value="frequency" checked> frequency</label>
+      <label class="chk"><input type="radio" name="arb-drive" value="time"> time</label>
+    </div>
+
+    <div class="row" id="arb-freqrow">
+      <label class="fixed" for="arb-freq" id="arb-freqlabel">Frequency</label>
+      <input type="text" id="arb-freq" class="num" value="1000" autocomplete="off">
+      <select id="arb-frequnit" aria-label="frequency or period unit"></select>
+      <span class="val" id="arb-freqout"></span>
+    </div>
+
+    <div id="arb-params"></div>
+
+    <div id="arb-comb" hidden>
+      <div class="row" role="group" aria-label="comb frequency input">
+        <span class="lbl fixed">Tones</span>
+        <label class="chk"><input type="radio" name="arb-combmode" value="range" checked> range</label>
+        <label class="chk"><input type="radio" name="arb-combmode" value="list"> list</label>
+      </div>
+      <div class="row" id="arb-combrange">
+        <label for="arb-cstart">start</label>
+        <input type="text" id="arb-cstart" class="num s" value="1">
+        <label for="arb-cstop">stop</label>
+        <input type="text" id="arb-cstop" class="num s" value="10">
+        <label for="arb-cstep">step</label>
+        <input type="text" id="arb-cstep" class="num s" value="1">
+        <span class="unit">Hz</span>
+      </div>
+      <div class="row" id="arb-comblist" hidden>
+        <label class="fixed" for="arb-clist">Hz, comma separated</label>
+        <input type="text" id="arb-clist" class="wide" value="1, 2, 3, 4, 5, 6, 7, 8, 9, 10">
+      </div>
+      <div class="row" role="group" aria-label="comb phases">
+        <span class="lbl fixed">Phases</span>
+        <label class="chk"><input type="radio" name="arb-phase" value="random" checked>
+          random (Monte&nbsp;Carlo optimised)</label>
+        <label class="chk"><input type="radio" name="arb-phase" value="zero"> zero (all in phase)</label>
+        <span class="spacer"></span>
+        <label for="arb-iters">iterations</label>
+        <input type="text" id="arb-iters" class="num s" value="1000">
+      </div>
+    </div>
+
+    <div class="bar">
+      <button id="arb-gen">generate</button>
+      <button id="arb-savecsv" class="ghost">save CSV</button>
+      <span class="spacer"></span>
+      <span class="val" id="arb-name"></span>
+    </div>
+
+    <div class="detail" id="arb-info"></div>
+    <div class="warnbox" id="arb-warn" hidden></div>
+    <canvas class="preview tall" id="arb-cv" role="img"
+            aria-label="generated arbitrary waveform preview"></canvas>
+
+    <div class="row">
+      <span class="lbl fixed">Upload to</span>
+      <select id="arb-upch" aria-label="target channel">
+        <option value="1">CH1</option><option value="2">CH2</option>
+      </select>
+      <label for="arb-upname">name</label>
+      <input type="text" id="arb-upname" class="num" maxlength="7" autocomplete="off"
+             title="the instrument's .RAF names are 7 characters">
+      <label class="chk"><input type="checkbox" id="arb-saveraf" checked>
+        also store as .RAF on the instrument</label>
+      <label for="arb-upamp">Vpp</label>
+      <input type="text" id="arb-upamp" class="num s" value="5">
+      <label for="arb-upoff">offset</label>
+      <input type="text" id="arb-upoff" class="num s" value="0">
+      <button id="arb-upload">upload</button>
+    </div>
+
+    <div class="row">
+      <span class="lbl fixed">Saved CSV</span>
+      <select id="arb-csvlist" class="wide" aria-label="waveform CSV files on this machine"></select>
+      <button id="arb-loadcsv" class="ghost">load</button>
+      <span class="spacer"></span>
+      <button id="arb-files" class="ghost tiny">refresh lists</button>
+    </div>
+    <div class="row">
+      <span class="lbl fixed">Instrument .RAF</span>
+      <select id="arb-raflist" class="wide" aria-label="arbitrary waveforms stored on the instrument"></select>
+      <button id="arb-loadraf" class="ghost">load to channel</button>
+      <select id="arb-rafch" aria-label="channel for the stored waveform">
+        <option value="1">CH1</option><option value="2">CH2</option>
+      </select>
+      <button id="arb-storeraf" class="ghost">store current</button>
+    </div>
+
+    <div class="statusline" id="arb-stat"></div>
+    <div class="hint" id="arb-dir"></div>
+    <div class="notice" id="arb-notice" hidden></div>
+  </div>
+
+  <h2>Quick presets</h2>
+  <div class="card wideblock" id="presetcard">
+    <div class="row" role="group" aria-label="preset target channel">
+      <span class="lbl fixed">Apply to</span>
+      <label class="chk"><input type="radio" name="preset-ch" value="1" checked> CH1</label>
+      <label class="chk"><input type="radio" name="preset-ch" value="2"> CH2</label>
+      <label class="chk"><input type="radio" name="preset-ch" value="both"> both</label>
+    </div>
+    <div class="row" id="preset-list"></div>
+    <div class="statusline" id="preset-stat"></div>
+    <div class="notice" id="preset-notice" hidden></div>
+  </div>
+
+  <div id="stat"></div>
+</div>
+
+<div id="toast" role="status" aria-live="polite"></div>
+<script src="static/rigol.js"></script>
+</body></html>

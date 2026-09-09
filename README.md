@@ -67,7 +67,7 @@ python dg822_gui.py
 Each module can be used independently:
 
 ```python
-from dg822_controller import DG822Controller
+from rigol_dg822 import DG822Controller
 
 with DG822Controller() as gen:
     gen.connect("USB0::0x1AB1::0x0643::DG8A204201757::0::INSTR")
@@ -80,6 +80,36 @@ with DG822Controller() as gen:
     gen.setup_square(channel=2, frequency=5000, amplitude=3.3, offset=1.65, duty_cycle=50)
     gen.output_on(2)
 ```
+
+### No instrument? Use the simulator
+
+`rigol_dg822.sim` is a DG822 that lives in the process. It presents the same
+interface a pyvisa resource presents, so it drops into the connection layer and
+needs **no VISA implementation installed** — reach it by resource name:
+
+```python
+from rigol_dg822 import DG822Controller, SIM_RESOURCE   # "SIM::DG822::INSTR"
+
+dg = DG822Controller(SIM_RESOURCE)      # or DG822Controller(simulate=True)
+dg.connect()
+dg.setup_sine(1, frequency=2500.0, amplitude=1.5)
+dg.output_on(1)
+print(dg.get_frequency(1))              # 2500.0 — state written is state read back
+```
+
+It parses the real SCPI strings the driver sends, including the DAC16 binary
+block, and models both channels, the arbitrary buffers, the sequence sample rate
+and a virtual internal `.RAF` file store. Commands it does not recognise go onto
+the error queue and come back from `:SYSTem:ERRor?`, so a malformed command is
+caught here rather than on the bench.
+
+`*IDN?` answers `Rigol Technologies,DG822,SIMULATED-NO-HARDWARE,SIM 00.02.05` —
+a simulated run can never be mistaken for hardware in a log. `discover_devices()`
+always lists the simulator, marked that way, after any real instruments.
+
+Nothing in the driver raises. With no VISA implementation installed,
+`discover_devices()` reports "no devices found" plus the reason and offers the
+simulator instead of throwing `Could not locate a VISA implementation`.
 
 ---
 
@@ -280,15 +310,25 @@ The frequency comb generator sums sinusoids at specified frequencies. Phases are
 
 ## Project Structure
 
+The driver is the importable package `rigol_dg822/`. This repo is also a git
+submodule of `xsphere-daq`, which puts this directory on `sys.path` — hence the
+package, rather than flat top-level modules that would collide in the parent's
+namespace.
+
 ```
-RIGOLDG822_controller/
+xsphere-rigol-dg822/
+├── rigol_dg822/            # the importable package
+│   ├── __init__.py         # re-exports the controller, the sim, the enums
+│   ├── connection.py       # VISA connection & SCPI I/O (pyvisa or sim)
+│   ├── controller.py       # High-level controller façade
+│   ├── waveform.py         # Waveform type & parameter configuration
+│   ├── output.py           # Output state, impedance, polarity, sync
+│   ├── arbitrary.py        # Arbitrary waveform generation & optimisation
+│   ├── plot.py             # Waveform preview maths + matplotlib (headless-safe)
+│   └── sim.py              # Simulated DG822 — needs no VISA backend
 ├── dg822_gui.py            # Tkinter GUI application (entry point)
-├── dg822_controller.py     # High-level controller façade
-├── dg822_connection.py     # VISA connection & SCPI I/O
-├── dg822_waveform.py       # Waveform type & parameter configuration
-├── dg822_output.py         # Output state, impedance, polarity, sync
-├── dg822_plot.py           # Matplotlib waveform preview & embedding
-├── dg822_arbitrarywf.py    # Arbitrary waveform generation & optimisation
+├── tools/                  # diagnose_*.py / test_*.py bench scripts
+├── docs/session-log.md
 ├── requirements.txt
 ├── README.md
 └── waveforms/              # Saved waveform CSV files
@@ -300,25 +340,33 @@ RIGOLDG822_controller/
 
 ```
 dg822_gui.py
-  ├── dg822_controller.py
-  │     ├── dg822_connection.py      (pyvisa)
-  │     ├── dg822_waveform.py
-  │     └── dg822_output.py
-  ├── dg822_plot.py                  (matplotlib, scipy)
-  └── dg822_arbitrarywf.py           (numpy)
+  ├── rigol_dg822.controller
+  │     ├── rigol_dg822.connection    (pyvisa, or rigol_dg822.sim)
+  │     │     └── rigol_dg822.sim     (stdlib only)
+  │     ├── rigol_dg822.waveform
+  │     └── rigol_dg822.output
+  ├── rigol_dg822.plot                (numpy; matplotlib/scipy/tkinter lazily)
+  └── rigol_dg822.arbitrary           (numpy)
 ```
+
+`rigol_dg822.plot` imports cleanly on a headless server: tkinter, the Tk canvas
+and pyplot are imported inside the functions that need a display, and
+`create_figure()` pins the Agg backend when pyplot is not already up. The pure
+`generate_*` helpers work with matplotlib absent entirely.
 
 ### Module roles
 
 | Module | Role |
 |---|---|
-| `dg822_connection.py` | VISA resource discovery, USB-TMC connection, SCPI `write` / `query` / `write_raw` (binary), IEEE-488.2 commands (`*RST`, `*IDN?`, `*OPC?`) |
-| `dg822_waveform.py` | `:APPLy` quick-setup for all standard waveforms, individual parameter R/W, binary DAC16 upload, `.RAF` file save/load/list |
-| `dg822_output.py` | Channel on/off, load impedance (1 Ω–10 kΩ or High-Z), polarity, sync output, trigger edge |
-| `dg822_controller.py` | Unified façade combining connection + waveform + output; convenience methods like `setup_sine()`, `setup_pulse()` (with centering) |
-| `dg822_plot.py` | Generates numpy time/voltage arrays for all waveform types, auto-scales axes, embeds matplotlib in tkinter via `FigureCanvasTkAgg` |
-| `dg822_arbitrarywf.py` | `ArbitraryWaveform` data container (normalised ±1 ↔ 14-bit DAC), `WaveformGenerator` factory (shapes, frequency combs), optimal-point calculators |
+| `rigol_dg822/connection.py` | VISA resource discovery, USB-TMC connection, SCPI `write` / `query` / `write_raw` (binary), IEEE-488.2 commands (`*RST`, `*IDN?`, `*OPC?`); routes to the simulator on `SIM::DG822::INSTR` |
+| `rigol_dg822/waveform.py` | `:APPLy` quick-setup for all standard waveforms, individual parameter R/W, binary DAC16 upload, `.RAF` file save/load/list |
+| `rigol_dg822/output.py` | Channel on/off, load impedance (1 Ω–10 kΩ or High-Z), polarity, sync output, trigger edge |
+| `rigol_dg822/controller.py` | Unified façade combining connection + waveform + output; convenience methods like `setup_sine()`, `setup_pulse()` (with centering) |
+| `rigol_dg822/plot.py` | Generates numpy time/voltage arrays for all waveform types, auto-scales axes, embeds matplotlib in tkinter via `FigureCanvasTkAgg` (imported lazily) |
+| `rigol_dg822/arbitrary.py` | `ArbitraryWaveform` data container (normalised ±1 ↔ 14-bit DAC), `WaveformGenerator` factory (shapes, frequency combs), optimal-point calculators |
+| `rigol_dg822/sim.py` | Simulated DG822 presenting the pyvisa resource interface: parses the real SCPI (including the DAC16 block), models both channels and a virtual `.RAF` store, and reports unknown commands through the error queue |
 | `dg822_gui.py` | Full tkinter GUI: connection panel, dual-channel tabs with live preview, arb generator dialog with auto-optimal points and warnings, presets, status bar |
+| `tools/` | Bench diagnostics and hardware scripts, kept out of the import path |
 
 ---
 

@@ -16,7 +16,7 @@ from enum import Enum
 
 if TYPE_CHECKING:
     import numpy
-    from dg822_arbitrarywf import ArbitraryWaveform
+    from .arbitrary import ArbitraryWaveform
 
 
 class WaveformType(Enum):
@@ -702,7 +702,7 @@ class DG822Waveform:
         
         Args:
             channel: Output channel (1 or 2)
-            waveform: ArbitraryWaveform object from dg822_arbitrarywf module
+            waveform: ArbitraryWaveform object from rigol_dg822.arbitrary
             
         Returns:
             True if successful
@@ -855,7 +855,7 @@ class DG822Waveform:
 # Module Test / Evaluation Mode
 # =============================================================================
 if __name__ == "__main__":
-    from dg822_connection import DG822Connection
+    from .connection import DG822Connection
     
     # Known working resource (update this if your device has a different ID)
     KNOWN_RESOURCE = 'USB0::0x1AB1::0x0643::DG8A204201757::0::INSTR'

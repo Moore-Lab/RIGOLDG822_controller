@@ -11,9 +11,9 @@ Date: 2026-01-08
 
 from typing import Optional, List, Tuple
 
-from dg822_connection import DG822Connection
-from dg822_waveform import DG822Waveform, WaveformType
-from dg822_output import DG822Output, OutputPolarity, SyncMode
+from .connection import DG822Connection
+from .waveform import DG822Waveform, WaveformType
+from .output import DG822Output, OutputPolarity, SyncMode
 
 
 class DG822Controller:
@@ -42,16 +42,19 @@ class DG822Controller:
                 dg.output_on(1)
     """
     
-    def __init__(self, resource_name: Optional[str] = None, timeout: int = 5000):
+    def __init__(self, resource_name: Optional[str] = None, timeout: int = 5000,
+                 simulate: bool = False):
         """
         Initialize the DG822 controller.
         
         Args:
-            resource_name: VISA resource string (optional)
+            resource_name: VISA resource string (optional). Pass
+                           rigol_dg822.SIM_RESOURCE for the simulated instrument.
             timeout: Communication timeout in milliseconds
+            simulate: Force the simulated backend, no VISA needed
         """
         # Initialize sub-modules
-        self._connection = DG822Connection(resource_name, timeout)
+        self._connection = DG822Connection(resource_name, timeout, simulate=simulate)
         self._waveform: Optional[DG822Waveform] = None
         self._output: Optional[DG822Output] = None
     
@@ -68,6 +71,11 @@ class DG822Controller:
     def idn(self) -> Optional[str]:
         """Return the instrument identification string."""
         return self._connection.idn
+    
+    @property
+    def is_simulated(self) -> bool:
+        """Return True if this controller drives the simulated instrument."""
+        return self._connection.is_simulated
     
     @property
     def connection(self) -> DG822Connection:

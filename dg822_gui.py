@@ -16,9 +16,9 @@ import threading
 import time
 import numpy as np
 
-from dg822_controller import DG822Controller
-from dg822_plot import WaveformPlotter
-from dg822_arbitrarywf import (
+from rigol_dg822.controller import DG822Controller
+from rigol_dg822.plot import WaveformPlotter
+from rigol_dg822.arbitrary import (
     ArbitraryWaveform, WaveformGenerator,
     compute_optimal_points, compute_optimal_points_for_comb,
     check_frequency_feasibility, DG822_MIN_POINTS, DG822_MAX_POINTS,
@@ -1098,7 +1098,7 @@ class ChannelFrame(ttk.LabelFrame):
                 # and a new DAC16 upload can be composited with stale data.
                 import time
                 if mode_before and mode_before.upper() in ('USER', 'SEQUENCE'):
-                    from dg822_waveform import WaveformType
+                    from rigol_dg822.waveform import WaveformType
                     controller.waveform.set_function(self.channel, WaveformType.SINE)
                     time.sleep(0.3)
                     print(f"[ARB UPLOAD] Cleared arb buffer (switched to SIN)")
