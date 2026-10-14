@@ -739,9 +739,14 @@ class DG822Waveform:
             channel: Output channel (1 or 2)
             
         Returns:
-            Name of the current arbitrary waveform
+            Always None: the DG800 has no query for this.
+
+        :SOURce<n>:FUNCtion:ARBitrary? is not in the DG800 command set. The
+        instrument never answers it, so sending it cost the caller the full VISA
+        timeout (5 s by default) and still returned None. It is no longer sent;
+        track the loaded waveform's name on the host instead.
         """
-        return self._conn.query(f":SOURce{channel}:FUNCtion:ARBitrary?")
+        return None
     
     def list_arbitrary_waveforms(self, channel: int = 1) -> Optional[str]:
         """
@@ -751,9 +756,15 @@ class DG822Waveform:
             channel: Output channel (1 or 2)
             
         Returns:
-            String listing available waveforms
+            Always None: the DG800 has no query for this.
+
+        :SOURce<n>:DATA:CATalog? is not in the DG800 command set (there is no
+        :SOURce:DATA subsystem at all), so it timed out after the full VISA
+        timeout and returned None. It is no longer sent. Stored arbitrary files
+        are listed by list_arb_files() (:MMEMory:CATalog:DATA:ARBitrary?); the
+        volatile buffer has no catalog on this instrument.
         """
-        return self._conn.query(f":SOURce{channel}:DATA:CATalog?")
+        return None
     
     def delete_arbitrary_waveform(self, channel: int, name: str) -> bool:
         """

@@ -15,6 +15,73 @@ the code is shaped the way it is.
 
 ---
 
+## 2026-09-16 — The 10 s page lag: a query the DG822 does not have
+
+**Context.** First use on the bench (DG822 `DG8A262801366`, firmware 00.02.06, NI-VISA):
+switching an output on from the web page took nearly 10 s to register.
+
+**Cause, measured on the running panel.** Every `GET /rigol/api/state` took **10.0 s**
+(four samples: 10.02–10.08 s). Each channel read sent `:SOURce<n>:FUNCtion:ARBitrary?`,
+which is not in the DG800 command set. The instrument never answered it (under SCPI a
+rejected query gets an "Undefined header" error and no reply; the error queue itself was
+not read on the bench), so the host sat out the full 5 s VISA timeout, once per channel.
+The other 16 queries in a poll took 20–80 ms together. The whole read holds the session
+lock, and the page polls again 1 s after each reply, so the lock was held about 10 s in
+every 11. An output-on request waited for the poll in progress (up to 10 s), then wrote
+`OUTPut ON`, then did its own channel read-back (another 5 s) before the page showed the
+change. A timed or N-cycle run's automatic OFF takes the same lock, so it could be late by
+up to 10 s as well.
+
+**Why no test caught it.** The simulator answered the query (with a made-up `"VOLATILE"`)
+and returned `""` instantly for any query it rejected, so a stall that costs 5 s on the
+bench cost nothing in simulation. The adversarial review had already flagged the sim for
+accepting seven headers the DG800 does not have (logged below as a known issue); this is
+what that finding cost in practice.
+
+**Fixes.**
+- `webapp._read_channel` no longer sends the query. `arb_name` was already tracked on the
+  host (upload and `load_raf` set it), and on hardware the query had only ever returned
+  `None`.
+- `DG822Waveform.get_arbitrary_waveform` and `list_arbitrary_waveforms`
+  (`:SOURce<n>:DATA:CATalog?`, also not a DG800 command — CLI `arb files` stalled 5 s on it)
+  return `None` without touching the bus.
+- `DG822Output.get_idle_level` / `set_idle_level` used `:OUTPut<n>:IDLE`, which does not
+  exist; CLI `status` stalled 5 s per channel on it. Now
+  `[:SOURce<n>]:BURSt:IDLE {FPT|TOP|CENTER|BOTTOM|<0-16383>}`, the real command.
+- **The simulator now behaves like the instrument when it cannot answer.** A query that
+  raises an error or returns nothing raises pyvisa's `VI_ERROR_TMO` (without the wait) and
+  is recorded in `SimulatedDG822.unanswered`. Its handlers for `:FUNCtion:ARBitrary`,
+  `:DATA:CATalog?`, `:OUTPut:SYNC:MODE`, `:OUTPut:TRIGger`, `:OUTPut:TRIGger:SLOPe` and
+  `:OUTPut:IDLE` are gone, so those now produce -113 like the DG800. `:BURSt:IDLE` was added.
+- `tools/test_unanswered_queries.py` drives the page's poll, every write endpoint's
+  read-back and CLI `status`, and asserts nothing went unanswered. A mutation check that put
+  the old query back failed the web checks with 14 unanswered queries (70 s on the bench).
+
+**Verified:** selftest 30/30 · `test_safety.py` all pass · `test_unanswered_queries.py` all
+pass · headless import clean · zero `Query error` lines in the selftest. **Not yet verified on
+the bench:** the running panel still has the old code loaded. Restarting it switches both
+generator outputs off (by design) and reconnects the cameras, so that is the operator's call.
+Expected after restart: a poll of well under 0.1 s, and output-on registering at once.
+
+**N-cycle runs are timed by the host, not the instrument** — answered for the operator and
+recorded here. `set_output(cycles=N)` switches the output on and arms a `threading.Timer`
+for N/frequency seconds that switches it off. The DG822 is never told N. Nothing lines the
+switching up with the waveform (the guide does not define the phase at `OUTPut ON`), so in
+general the run starts and ends part-way through a cycle, and the length is only as good
+as the Windows timer (~15.6 ms by default), the USB write and the relay, plus any wait for
+the session lock. Fine for a run of seconds or longer; meaningless as a cycle count for
+short bursts. The instrument has a real N-cycle burst (`:BURSt:MODE TRIGgered`,
+`:BURSt:NCYCles` 1–1,000,000, manual/external/internal trigger, `:BURSt:TRIGger`) that is
+exact to the cycle and starts at a set phase. Nothing here uses it yet.
+
+**Still sends headers the DG800 does not have (writes, so no stall):**
+`delete_arbitrary_waveform` (`:SOURce<n>:DATA:DELete`, used by CLI `arb delete` and the
+selftest; the CLI does report the -113 it causes on hardware), and the unused
+`set_sync_mode`, `enable_trigger_output`, `disable_trigger_output`, `set_trigger_slope`.
+
+**Next.** Restart the panel and confirm the poll time on the bench. Then decide whether
+N-cycle runs should use the instrument's burst mode.
+
 ## 2026-09-09 — Adversarial review: six critical defects, and what the simulator was hiding
 
 **Context.** The three front ends landed (entry below) with everything "verified" against

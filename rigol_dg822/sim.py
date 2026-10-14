@@ -46,6 +46,26 @@ SIM_IDN = "Rigol Technologies,DG822,SIMULATED-NO-HARDWARE,SIM 00.02.05"
 
 SIM_VERSION = "SIMULATED,1.0"
 
+
+class SimulatedTimeout(TimeoutError):
+    """Stands in for pyvisa's VI_ERROR_TMO when pyvisa is not importable."""
+
+
+def _timeout_error(timeout_ms) -> Exception:
+    """The exception a real query raises when the instrument never answers.
+
+    pyvisa's own VisaIOError(VI_ERROR_TMO) when pyvisa is importable, so code
+    that catches that type specifically behaves the same against the sim; a
+    TimeoutError subclass otherwise (the sim must work with no VISA installed).
+    """
+    try:
+        from pyvisa import constants, errors
+        return errors.VisaIOError(constants.StatusCode.error_timeout)
+    except Exception:
+        return SimulatedTimeout(
+            f"VI_ERROR_TMO: no reply within {timeout_ms} ms (simulated)")
+
+
 # Firmware 00.02.x limits, mirrored so the sim rejects what the hardware rejects.
 MIN_ARB_POINTS = 8
 MAX_ARB_POINTS = 8192
@@ -72,7 +92,7 @@ _SPECS = [
     "TRAiling", "SYMMetry", "SRATe",
     "STATe", "LOAD", "INFinity", "POLarity", "NORMal", "INVerted", "SYNC",
     "MODE", "CARRier", "MARKer", "POSitive", "NEGative", "TRIGger", "SLOPe",
-    "IDLE",
+    "IDLE", "BURSt",
     "CDIRectory", "STORe", "ERRor", "VERSion", "BEEPer", "IMMediate",
     "VOLATILE", "END", "CONtinue", "DEFault", "MINimum", "MAXimum",
 ]
@@ -192,7 +212,11 @@ class SimulatedDG822:
 
         self.channels: Dict[int, _Channel] = {1: _Channel(), 2: _Channel()}
         self._errors: List[Tuple[int, str]] = []
+        self._error_count = 0          # monotonic; the queue itself is capped
         self._closed = False
+        # Every query the instrument would have left unanswered (the host would
+        # have waited out the full VISA timeout for each). Tests assert on this.
+        self.unanswered: List[str] = []
 
         # Instrument-internal volume, not a host path: :MMEMory:CDIRectory "C:\"
         self._cwd = "C:\\"
@@ -220,11 +244,21 @@ class SimulatedDG822:
 
     def query(self, command: str) -> str:
         self._check_open()
+        errors_before = self._error_count
         reply = self._dispatch(str(command))
-        # The connection layer calls .strip() on whatever comes back, so this
-        # must always be a str -- an unanswerable query returns empty, which the
-        # float getters turn into None, exactly as a real timeout would.
-        return "" if reply is None else str(reply)
+        rejected = self._error_count > errors_before
+        if reply is None or (rejected and reply == ""):
+            # The DG822 does not answer a query it rejected: it queues the error
+            # and sends nothing, so the host's read sits out the whole VISA
+            # timeout (5 s by default) before failing. This used to return ""
+            # instantly, which is how :SOURce:FUNCtion:ARBitrary? -- a header
+            # the instrument does not have -- reached the web page's poll and
+            # made every refresh take 10 s on the bench while every simulated
+            # test stayed fast and green. Raise the same error pyvisa raises,
+            # without the wait, and keep a record a test can assert is empty.
+            self.unanswered.append(str(command).strip())
+            raise _timeout_error(self.timeout)
+        return str(reply)
 
     # -- inspection (sim-only; the driver never calls these) ----------------
 
@@ -253,6 +287,7 @@ class SimulatedDG822:
     def _error(self, code: int, message: str) -> None:
         # Bounded like a real error queue; the instrument drops the oldest.
         self._errors.append((code, message))
+        self._error_count += 1
         del self._errors[:-32]
 
     def _channel(self, index: int) -> Optional[_Channel]:
@@ -443,10 +478,16 @@ class SimulatedDG822:
             self._error(-109, f"Missing parameter; {command.strip()}")
             return None
 
-        elif key == ("FUNC", "ARB"):
+        elif key == ("BURS", "IDLE"):
+            # [:SOURce[<n>]]:BURSt:IDLE {FPT|TOP|CENTER|BOTTOM|<0..16383>}
             if is_query:
-                return ch.arb_name
-            ch.arb_name = args[0].strip() if args else ch.arb_name
+                return ch.idle
+            token = (args[0].strip().upper() if args else "")
+            if token in ("FPT", "TOP", "CENTER", "BOTTOM") or (
+                    token.isdigit() and 0 <= int(token) <= 16383):
+                ch.idle = token
+            else:
+                self._error(-224, f"Illegal parameter value; {command.strip()}")
             return None
 
         elif key == ("FUNC", "SEQ", "SRAT"):
@@ -559,10 +600,6 @@ class SimulatedDG822:
             self.channels[2].phase = self.channels[1].phase
             return None
 
-        elif key == ("DATA", "CAT"):
-            if is_query:
-                return '"VOLATILE"' if ch.arb_data else '""'
-
         elif key == ("DATA", "DEL"):
             ch.arb_data = []
             return None
@@ -636,16 +673,6 @@ class SimulatedDG822:
                 ch.sync = state
             return None
 
-        if key == ("SYNC", "MODE"):
-            if is_query:
-                return ch.sync_mode
-            token = _canon(first)
-            if token in ("NORM", "CARR", "MARK"):
-                ch.sync_mode = token
-            else:
-                self._error(-224, f"Illegal parameter value; {first.strip()!r}")
-            return None
-
         if key == ("SYNC", "POL"):
             if is_query:
                 return ch.sync_polarity
@@ -656,31 +683,11 @@ class SimulatedDG822:
                 self._error(-224, f"Illegal parameter value; {first.strip()!r}")
             return None
 
-        if key == ("TRIG",):
-            if is_query:
-                return "1" if ch.trigger_out else "0"
-            state = _is_on(first)
-            if state is None:
-                self._error(-104, f"Data type error; {first.strip()!r}")
-            else:
-                ch.trigger_out = state
-            return None
-
-        if key == ("TRIG", "SLOP"):
-            if is_query:
-                return ch.trigger_slope
-            token = _canon(first)
-            if token in ("POS", "NEG"):
-                ch.trigger_slope = token
-            else:
-                self._error(-224, f"Illegal parameter value; {first.strip()!r}")
-            return None
-
-        if key == ("IDLE",):
-            if is_query:
-                return ch.idle
-            ch.idle = first.strip().upper() or ch.idle
-            return None
+        # No :OUTPut:SYNC:MODE, :OUTPut:TRIGger, :OUTPut:TRIGger:SLOPe or
+        # :OUTPut:IDLE here: the DG800's :OUTPut subsystem is IMPedance, LOAD,
+        # POLarity, STATe, SYNC, SYNC:POLarity and VOLLimit only (programming
+        # guide 2981-2990). The sim used to answer all four, which let the
+        # driver ship queries the instrument never replies to.
 
         self._error(-113, f"Undefined header; {command.strip()}")
         return "" if is_query else None

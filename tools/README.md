@@ -55,6 +55,8 @@ absorbed.
 | `test_user_mode.py` | hardware | `USER`-mode commands on newer firmware (they reset the waveform to SINC) |
 | `diagnose_waveforms.py` | nothing | Pure numpy: dumps trapezoid and comb arrays and their DAC values to find wrap discontinuities. Runs anywhere |
 | `test_e2e.py` | hardware, or the simulator | The GUI's upload flow through `DG822Controller` |
+| `test_safety.py` | nothing (simulator) | Regression tests for every way an output could be left driving, or the page could show a level the instrument is not emitting |
+| `test_unanswered_queries.py` | nothing (simulator) | Every query the web page and CLI send is one the DG822 answers. An unrecognised query is never answered, so each one costs the full 5 s VISA timeout — this is what made every page refresh take 10 s |
 
 `test_e2e.py` is the one hardware script that can run without hardware: it goes
 through the controller rather than raw pyvisa, so changing its `VISA` constant to

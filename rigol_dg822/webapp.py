@@ -784,9 +784,12 @@ class DG822Session:
             if v is not None:
                 c[key] = v
 
-        name = wf.get_arbitrary_waveform(n)
-        if name:
-            c["arb_name"] = name.strip().strip('"')
+        # arb_name is host-tracked (upload and load_raf set it), never queried.
+        # This read used to send :SOURce<n>:FUNCtion:ARBitrary?, which is not in
+        # the DG800 command set: the instrument never replies, so every channel
+        # read sat out the full 5 s VISA timeout while holding the session lock.
+        # Measured on the bench (fw 00.02.06): every /api/state took 10.0 s, and
+        # an output-on request queued behind that poll for up to the same again.
 
         # What an arbitrary buffer is actually clocking out at -- but WHICH
         # number that is depends on the arb mode, and there is no driver getter

@@ -379,7 +379,10 @@ class DG822Output:
         Returns:
             True if successful
         """
-        cmd = f":OUTPut{channel}:IDLE {level}"
+        # :OUTPut<n>:IDLE does not exist on the DG800 (its :OUTPut subsystem is
+        # IMPedance/LOAD/POLarity/STATe/SYNC/VOLLimit only). The idle level is a
+        # burst setting: [:SOURce[<n>]]:BURSt:IDLE {FPT|TOP|CENTER|BOTTOM|<0-16383>}.
+        cmd = f":SOURce{channel}:BURSt:IDLE {level}"
         return self._conn.write(cmd)
     
     def get_idle_level(self, channel: int = 1) -> Optional[str]:
@@ -392,7 +395,9 @@ class DG822Output:
         Returns:
             Idle level setting string
         """
-        return self._conn.query(f":OUTPut{channel}:IDLE?")
+        # See set_idle_level. The old :OUTPut<n>:IDLE? was never answered, so it
+        # cost the full VISA timeout on every call -- 10 s per `cli status`.
+        return self._conn.query(f":SOURce{channel}:BURSt:IDLE?")
     
     # =========================================================================
     # Convenience Methods
